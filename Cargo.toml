@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "sppark-msm"]
 
 [package]
 name = "arkworks_groth16"
@@ -12,6 +12,7 @@ crate-type = ["rlib"]  # Add rlib for testing
 
 [features]
 default = ["r1cs", "parallel", "pvugc-hooks", "asm"]
+gpu = ["sppark-msm", "sppark-msm/gpu"]
 r1cs = ["ark-groth16/r1cs"]
 parallel = [
     "ark-ff/parallel",
@@ -24,6 +25,7 @@ asm = [
 ]
 
 [dependencies]
+sppark-msm = { path = "sppark-msm", optional = true }
 # Arkworks ecosystem (0.5 for PVUGC compatibility)
 ark-bls12-381 = "0.5"
 ark-bls12-377 = "0.5"  # BLS12-377 for production (with BW6-761)

@@ -1,0 +1,4 @@
+[submodule "sppark-msm/sppark"]
+	path = sppark-msm/sppark
+	url = https://github.com/DevElCuy/sppark
+	branch = v0.1.14

@@ -4,6 +4,7 @@
 //! (stripped of Powers of Tau) by using pre-computed quotient bases H_{ij}.
 //! This is required to secure the One-Sided PVUGC scheme against algebraic attacks.
 
+use crate::msm_backend;
 use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM}; // AffineRepr imported
 use ark_ff::PrimeField;
@@ -98,7 +99,7 @@ pub fn prove_lean_with_randomizers<E: Pairing, C: ConstraintSynthesizer<E::Scala
     }
     let scalars_bigint: Vec<_> = full_assignment.iter().map(|s| s.into_bigint()).collect();
 
-    let a_linear = <E::G1 as VariableBaseMSM>::msm_bigint(&pk.a_query, &scalars_bigint);
+    let a_linear = msm_backend::msm_g1(&pk.a_query, &scalars_bigint);
     a_acc += a_linear;
     a_acc += pk.delta_g1.into_group() * r;
     eprintln!(
@@ -119,7 +120,7 @@ pub fn prove_lean_with_randomizers<E: Pairing, C: ConstraintSynthesizer<E::Scala
 
     // B_g1 for C computation
     let mut b_g1_acc = pk.beta_g1.into_group();
-    let b_g1_linear = <E::G1 as VariableBaseMSM>::msm_bigint(&pk.b_g1_query, &scalars_bigint);
+    let b_g1_linear = msm_backend::msm_g1(&pk.b_g1_query, &scalars_bigint);
     b_g1_acc += b_g1_linear;
     b_g1_acc += pk.delta_g1.into_group() * s;
     eprintln!(
@@ -140,7 +141,7 @@ pub fn prove_lean_with_randomizers<E: Pairing, C: ConstraintSynthesizer<E::Scala
     if pk.l_query.len() != witness_scalars_bigint.len() {
         return Err(ark_relations::r1cs::SynthesisError::Unsatisfiable);
     }
-    let l_linear = <E::G1 as VariableBaseMSM>::msm_bigint(&pk.l_query, witness_scalars_bigint);
+    let l_linear = msm_backend::msm_g1(&pk.l_query, witness_scalars_bigint);
     c_acc += l_linear;
     eprintln!(
         "[LeanProver] L-term MSM ({} points) in {:.2}ms",
@@ -188,7 +189,7 @@ pub fn prove_lean_with_randomizers<E: Pairing, C: ConstraintSynthesizer<E::Scala
             let (h_bases, h_scalars): (Vec<E::G1Affine>, Vec<E::ScalarField>) =
                 chunk.iter().cloned().unzip();
             let h_scalars_bigint: Vec<_> = h_scalars.iter().map(|s| s.into_bigint()).collect();
-            let h_msm = <E::G1 as VariableBaseMSM>::msm_bigint(&h_bases, &h_scalars_bigint);
+            let h_msm = msm_backend::msm_g1(&h_bases, &h_scalars_bigint);
 
             if num_chunks > 1 {
                 eprintln!(
