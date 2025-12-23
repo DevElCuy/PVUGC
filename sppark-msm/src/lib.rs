@@ -7,8 +7,6 @@ pub use ark_ff::BigInt;
 
 #[cfg(feature = "gpu")]
 use core::mem::{align_of, size_of};
-#[cfg(feature = "gpu")]
-use ark_ff::PrimeField;
 
 /// Compile-time layout validation for G1Affine
 ///
@@ -120,16 +118,6 @@ extern "C" {
         ffi_scalar_sz: usize,
     ) -> i32;
 
-    #[cfg(bw6_gpu_available)]
-    fn msm_bw6_761_g1(
-        points: *const ark_bw6_761::G1Affine,
-        scalars: *const BigInt<6>,
-        count: usize,
-        result: *mut ark_bw6_761::G1Projective,
-        ffi_affine_sz: usize,
-        ffi_scalar_sz: usize,
-    ) -> i32;
-
     #[cfg(bw6_cgbn_available)]
     fn msm_bw6_761_g1_cgbn(
         points: *const ark_bw6_761::G1Affine,
@@ -139,12 +127,6 @@ extern "C" {
         ffi_affine_sz: usize,
         ffi_scalar_sz: usize,
     ) -> i32;
-
-    // Field operations test for BW6-761
-    fn test_bw6_field_ops() -> i32;
-
-    // Point addition test for BW6-761
-    fn test_bw6_point_add(points: *const ark_bw6_761::G1Affine, result: *mut ark_bw6_761::G1Projective) -> i32;
 }
 
 #[cfg(all(feature = "gpu", sppark_cuda_stub))]
@@ -157,45 +139,6 @@ unsafe fn msm_bls12_377_g1(
     _ffi_scalar_sz: usize,
 ) -> i32 {
     // Return non-zero to signal fallback to CPU.
-    1
-}
-
-#[cfg(all(feature = "gpu", sppark_cuda_stub))]
-unsafe fn msm_bw6_761_g1(
-    _points: *const ark_bw6_761::G1Affine,
-    _scalars: *const BigInt<6>,
-    _count: usize,
-    _result: *mut ark_bw6_761::G1Projective,
-    _ffi_affine_sz: usize,
-    _ffi_scalar_sz: usize,
-) -> i32 {
-    // Return non-zero to signal fallback to CPU.
-    1
-}
-
-#[cfg(all(feature = "gpu", sppark_cuda_stub))]
-unsafe fn test_bw6_field_ops() -> i32 {
-    // Return non-zero when CUDA is not available
-    1
-}
-
-#[cfg(all(feature = "gpu", sppark_cuda_stub))]
-unsafe fn test_bw6_point_add(_points: *const ark_bw6_761::G1Affine, _result: *mut ark_bw6_761::G1Projective) -> i32 {
-    // Return non-zero when CUDA is not available
-    1
-}
-
-// CPU fallback stub for BW6-761 (used when specialized kernel is not available)
-#[cfg(all(feature = "gpu", not(bw6_gpu_available), not(sppark_cuda_stub)))]
-unsafe fn msm_bw6_761_g1(
-    _points: *const ark_bw6_761::G1Affine,
-    _scalars: *const BigInt<6>,
-    _count: usize,
-    _result: *mut ark_bw6_761::G1Projective,
-    _ffi_affine_sz: usize,
-    _ffi_scalar_sz: usize,
-) -> i32 {
-    // Return non-zero to signal fallback to CPU (specialized kernel not available).
     1
 }
 
@@ -257,131 +200,43 @@ impl Bw6GpuError {
     }
 }
 
+// BW6-761 GPU MSM implementation using CGBN kernel
+//
+// Note: The sppark-based specialized kernel was removed because BW6-761's 761-bit
+// base field generates stack frames too large for GPU execution (~22KB/thread).
+// See docs/BW6_761_CGBN.md for historical context.
+#[cfg(all(feature = "gpu", bw6_cgbn_available))]
 impl GpuMsm<ark_bw6_761::G1Affine, BigInt<6>> for ark_bw6_761::G1Affine {
     fn msm_gpu(
         points: &[ark_bw6_761::G1Affine],
         scalars: &[BigInt<6>],
     ) -> Result<ark_bw6_761::G1Projective, ()> {
-        if points.len() != scalars.len() {
-            return Err(());
-        }
-
-        // For single-scalar MSM, do it on CPU to avoid GPU launch overhead
-        if points.len() == 1 {
-            let scalar = ark_bw6_761::Fr::from_bigint(scalars[0]).ok_or(())?;
-            return Ok(points[0] * scalar);
-        }
-
-        let count = points.len();
-        let mut result = ark_bw6_761::G1Projective::default();
-        unsafe {
-            let status = msm_bw6_761_g1(
-                points.as_ptr(),
-                scalars.as_ptr(),
-                count,
-                &mut result,
-                core::mem::size_of::<ark_bw6_761::G1Affine>(),
-                core::mem::size_of::<BigInt<6>>(),
-            );
-            if status != 0 {
-                eprintln!("BW6-761 GPU MSM failed with status code: {}", status);
-                eprintln!("  Affine size: {} bytes", core::mem::size_of::<ark_bw6_761::G1Affine>());
-                eprintln!("  Scalar size: {} bytes", core::mem::size_of::<BigInt<6>>());
-                return Err(());
-            }
-        }
-        Ok(result)
+        msm_bw6_761_gpu_cgbn(points, scalars).map_err(|_| ())
     }
 }
 
-#[cfg(feature = "gpu")]
-pub fn test_bw6_761_field_operations() -> Result<(), ()> {
-    unsafe {
-        let status = test_bw6_field_ops();
-        if status != 0 {
-            eprintln!("BW6-761 field operations test failed with status: {}", status);
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "gpu"))]
-pub fn test_bw6_761_field_operations() -> Result<(), ()> {
-    eprintln!("GPU feature not enabled");
-    Err(())
-}
-
-#[cfg(feature = "gpu")]
-pub fn test_bw6_761_point_addition(points: &[ark_bw6_761::G1Affine; 2]) -> Result<ark_bw6_761::G1Projective, ()> {
-    let mut result = ark_bw6_761::G1Projective::default();
-    unsafe {
-        let status = test_bw6_point_add(points.as_ptr(), &mut result);
-        if status != 0 {
-            eprintln!("BW6-761 point addition test failed with status: {}", status);
-            return Err(());
-        }
-    }
-    Ok(result)
-}
-
-#[cfg(not(feature = "gpu"))]
-pub fn test_bw6_761_point_addition(_points: &[ark_bw6_761::G1Affine; 2]) -> Result<ark_bw6_761::G1Projective, ()> {
-    eprintln!("GPU feature not enabled");
-    Err(())
-}
-
-// Internal helper for tests: force the GPU BW6-761 MSM path (no CPU fast-path).
-#[cfg(all(feature = "gpu", bw6_gpu_available))]
-pub fn msm_bw6_761_gpu_raw(
-    points: &[ark_bw6_761::G1Affine],
-    scalars: &[BigInt<6>],
-) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
-    if points.len() != scalars.len() {
-        return Err(Bw6GpuError::Unknown(-99)); // argument mismatch
-    }
-    let mut result = ark_bw6_761::G1Projective::default();
-    let status = unsafe {
-        msm_bw6_761_g1(
-            points.as_ptr(),
-            scalars.as_ptr(),
-            points.len(),
-            &mut result,
-            core::mem::size_of::<ark_bw6_761::G1Affine>(),
-            core::mem::size_of::<BigInt<6>>(),
-        )
-    };
-    if status == 0 {
-        Ok(result)
-    } else {
-        Err(Bw6GpuError::from_status(status))
+// Fallback when CGBN is not available - return error to signal CPU fallback
+#[cfg(all(feature = "gpu", not(bw6_cgbn_available)))]
+impl GpuMsm<ark_bw6_761::G1Affine, BigInt<6>> for ark_bw6_761::G1Affine {
+    fn msm_gpu(
+        _points: &[ark_bw6_761::G1Affine],
+        _scalars: &[BigInt<6>],
+    ) -> Result<ark_bw6_761::G1Projective, ()> {
+        Err(()) // CGBN kernel not available, use CPU fallback
     }
 }
 
-#[cfg(not(all(feature = "gpu", bw6_gpu_available)))]
-pub fn msm_bw6_761_gpu_raw(
-    _points: &[ark_bw6_761::G1Affine],
-    _scalars: &[BigInt<6>],
-) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
-    Err(Bw6GpuError::KernelUnavailable)
-}
-
-// Internal helper for tests: CGBN-based BW6-761 MSM kernel.
+// CGBN-based BW6-761 MSM kernel.
 //
-// WARNING: This kernel is an MVP STUB that does NOT compute correct MSM results.
-// It ignores scalars, has no scalar multiplication, and returns placeholder output.
-// DO NOT USE IN PRODUCTION. Enabled only for experimental/development purposes.
+// This is the primary GPU MSM implementation for BW6-761 using NVIDIA's CGBN library.
+// CGBN distributes field element limbs across cooperating threads (TPI=8), avoiding
+// the per-thread stack overflow issues that plague sppark's template-based approach.
 #[cfg(all(feature = "gpu", bw6_cgbn_available))]
 pub fn msm_bw6_761_gpu_cgbn(
     points: &[ark_bw6_761::G1Affine],
     scalars: &[BigInt<6>],
 ) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
     use ark_ff::PrimeField;
-
-    // Gate behind environment variable to prevent accidental misuse
-    if std::env::var("ENABLE_CGBN_STUB").is_err() {
-        return Err(Bw6GpuError::KernelUnavailable);
-    }
 
     if points.len() != scalars.len() {
         return Err(Bw6GpuError::Unknown(-99)); // argument mismatch

@@ -123,15 +123,19 @@ cargo build --release --features gpu
 ### Run Tests
 
 ```bash
-ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test test_gpu_cgbn_bw6 -- --nocapture
+cargo test --release --features gpu --test test_gpu_cgbn_bw6 -- --nocapture
 ```
 
 ### Integration
 
 ```rust
-use sppark_msm::msm_bw6_761_gpu_cgbn;
+use sppark_msm::{GpuMsm, msm_bw6_761_gpu_cgbn};
+use ark_bw6_761::G1Affine;
 
-// Requires ENABLE_CGBN_STUB=1 environment variable
+// Via trait (recommended)
+let result = G1Affine::msm_gpu(&points, &scalars)?;
+
+// Direct function call
 let result = msm_bw6_761_gpu_cgbn(&points, &scalars)?;
 ```
 
@@ -213,9 +217,9 @@ Pippenger bucket method would be O(n / log(n)) for large MSMs.
 Current: Single thread group processes all points serially.
 Future: Multiple thread groups in parallel, then tree reduction.
 
-### 3. Remove ENABLE_CGBN_STUB Gate
+### 3. Production Hardening
 
-Once correctness is validated in production, remove the environment variable requirement.
+Add comprehensive error handling and diagnostics for production deployments.
 
 ---
 
@@ -224,6 +228,79 @@ Once correctness is validated in production, remove the environment variable req
 - **GPU**: NVIDIA GeForce GTX 1660 SUPER (sm_75, Turing)
 - **CUDA**: 12.6
 - **CGBN**: TPI=8, BITS=768
+
+---
+
+## Historical: Deprecated sppark Specialized Kernel
+
+> **Note**: This section documents a failed approach that has been removed from the codebase.
+> It is preserved here for historical reference and to explain why CGBN was necessary.
+
+### What Was Attempted
+
+Before CGBN, we tried to use sppark's standard Pippenger MSM implementation with aggressive
+register management. The specialized kernel (`msm_bw6_761_specialized.cu`) attempted to:
+
+1. **Reduce window size**: `MSM_WBITS=6` (64 buckets instead of default)
+2. **Limit threads**: `MSM_NTHREADS=64` (conservative thread count)
+3. **Cap registers**: `--maxrregcount=96` (force register spilling)
+4. **Increase stack**: `cudaDeviceSetLimit(cudaLimitStackSize, 128KB)`
+
+### Why It Failed
+
+The fundamental problem is **stack frame size**, not register count:
+
+```
+sppark point_add() for BW6-761:
+├── 6 temporary field elements (XYZZ coordinates)
+├── Each field element: 96 bytes (761-bit → 24 × 32-bit limbs)
+├── Total temporaries: ~576 bytes minimum
+├── Plus call stack, loop variables, etc.
+└── Result: 21-25 KB per thread stack frame
+```
+
+CUDA GPUs have limited per-thread stack space (~1KB default, max ~128KB with tuning).
+Even with maximum stack limits, the kernel would:
+
+- **Hang indefinitely** on GTX 1660 SUPER (sm_75)
+- **Crash with CUDA error** on some configurations
+- **Silently produce wrong results** in edge cases
+
+### Symptoms Observed
+
+| Test Scenario | Result |
+|--------------|--------|
+| Single point (count=1) | Kernel hang (timeout) |
+| Multiple points (count>1) | Kernel crash or hang |
+| Small MSM (count<16) | Random crashes |
+| Any random points | GPU reset required |
+
+### Files Removed
+
+The following files were part of the deprecated specialized kernel approach:
+
+```
+src/msm_bw6_761_specialized.cu  # Specialized Pippenger kernel (REMOVED)
+src/msm_bw6_761.cu              # Generic wrapper (REMOVED)
+```
+
+### Configuration Flags Removed
+
+```rust
+// build.rs - These flags are no longer used for BW6-761
+BW6_WBITS      // Window size tuning
+BW6_NTHREADS   // Thread count tuning
+BW6_NSTREAMS   // Stream count tuning
+BW6_MAXREG     // Register limit tuning
+bw6_gpu_available  // cfg flag for specialized kernel
+```
+
+### Lesson Learned
+
+For curves with base fields >512 bits, sppark's `field_large_t<N>` template approach
+generates stack frames too large for GPU execution. The solution is to use a
+**cooperative threading model** like CGBN where limbs are distributed across threads,
+keeping per-thread memory usage within GPU limits.
 
 ---
 

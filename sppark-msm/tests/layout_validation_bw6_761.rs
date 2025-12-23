@@ -1,4 +1,24 @@
-#![cfg(all(feature = "gpu", sppark_cuda_built))]
+// BW6-761 Layout Validation Tests
+// Custom test harness (harness = false) to avoid Rust test framework CUDA cleanup conflicts
+//
+// CRITICAL: Why Custom Harness?
+// ===============================
+// The default Rust test framework causes SIGSEGV crashes due to CUDA cleanup order:
+// 1. Test runs on worker thread
+// 2. CUDA context is thread-local
+// 3. When worker thread exits, CUDA runtime destroys context automatically
+// 4. Rust test framework then tries to Drop variables that reference destroyed CUDA state
+// 5. Result: SIGSEGV (NULL pointer dereference)
+//
+// Solution: Custom harness = main() function, no worker threads, predictable cleanup order.
+//
+// Run with: cargo test --release --features gpu --test layout_validation_bw6_761
+//
+// STATUS: These tests currently FAIL because the CGBN kernel produces incorrect results.
+// The kernel launches successfully (no crashes), but correctness needs to be fixed.
+// Once the kernel is corrected, these tests will validate layout compatibility.
+
+#![cfg(all(feature = "gpu", bw6_cgbn_available))]
 
 //! Runtime layout validation test for BW6-761
 //!
@@ -15,175 +35,203 @@
 use ark_bw6_761::{Fr, G1Affine, G1Projective};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{BigInt, PrimeField};
-use sppark_msm::GpuMsm;
+use std::mem::ManuallyDrop;
+
+/// Call CGBN MSM kernel via public wrapper
+fn call_msm(
+    points: &[G1Affine],
+    scalars: &[BigInt<6>],
+) -> Result<G1Projective, ()> {
+    use sppark_msm::msm_bw6_761_gpu_cgbn;
+
+    msm_bw6_761_gpu_cgbn(points, scalars).map_err(|_| ())
+}
+
+// ============================================================================
+// Test Functions
+// ============================================================================
 
 /// Test that validates BW6-761 G1Affine layout using known generator point
-///
-/// Strategy: Use the generator point which has known x, y coordinates.
-/// If CUDA reads the coordinates correctly, field ordering is correct.
-#[test]
-fn test_bw6_761_g1affine_layout_with_generator() {
-    // Generator has known, well-defined x and y coordinates
-    let generator = G1Affine::generator();
+fn test_bw6_761_g1affine_layout_with_generator() -> bool {
+    println!("\n=== Test: G1Affine Layout with Generator ===");
 
-    // Scalar 1 should give us back the generator
+    let generator = G1Affine::generator();
     let scalar_one = Fr::from(1u64).into_bigint();
 
-    // This MSM should compute: 1 * G = G
-    let result = G1Affine::msm_gpu(&[generator], &[scalar_one])
-        .expect("GPU MSM failed - may indicate layout issue");
+    let points = ManuallyDrop::new(vec![generator]);
+    let scalars = ManuallyDrop::new(vec![scalar_one]);
+
+    let result = match call_msm(&points, &scalars) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ GPU MSM failed");
+            return false;
+        }
+    };
 
     let result_affine = result.into_affine();
 
-    // If field ordering is correct, result should equal generator
-    assert_eq!(
-        result_affine, generator,
-        "BW6-761 Generator MSM failed - CUDA may be reading fields in wrong order"
-    );
+    if result_affine != generator {
+        println!("  ❌ Generator MSM failed - CUDA may be reading fields in wrong order");
+        println!("  Expected: {:?}", generator);
+        println!("  Got: {:?}", result_affine);
+        return false;
+    }
 
-    // Additionally verify x and y coordinates match
-    assert_eq!(
-        result_affine.x, generator.x,
-        "BW6-761 X coordinate mismatch - field ordering issue"
-    );
-    assert_eq!(
-        result_affine.y, generator.y,
-        "BW6-761 Y coordinate mismatch - field ordering issue"
-    );
-
-    println!("✅ BW6-761 G1Affine layout validated: generator MSM correct");
+    println!("  ✅ PASS - G1Affine layout validated");
+    true
 }
 
 /// Test that validates BigInt<6> layout using known scalar values
-///
-/// Strategy: Use prime field operations with known results.
-/// If CUDA interprets scalars correctly, limb ordering is correct.
-///
-/// Note: BW6-761 uses BigInt<6> (6 x 64-bit limbs) for its 377-bit scalar field
-#[test]
-fn test_bw6_761_bigint_layout_with_known_scalars() {
+fn test_bw6_761_bigint_layout_with_known_scalars() -> bool {
+    println!("\n=== Test: BigInt<6> Layout with Known Scalars ===");
+
     let generator = G1Affine::generator();
 
     // Test with scalar = 2
     let scalar_2 = Fr::from(2u64).into_bigint();
-    let result_2 = G1Affine::msm_gpu(&[generator], &[scalar_2])
-        .expect("GPU MSM failed");
+    let points = ManuallyDrop::new(vec![generator]);
+    let scalars = ManuallyDrop::new(vec![scalar_2]);
 
-    // Expected: 2 * G
+    let result_2 = match call_msm(&points, &scalars) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ GPU MSM failed for scalar=2");
+            return false;
+        }
+    };
+
     let expected_2 = (generator * Fr::from(2u64)).into_affine();
 
-    assert_eq!(
-        result_2.into_affine(), expected_2,
-        "BW6-761 Scalar=2 MSM failed - BigInt<6> limb ordering issue"
-    );
+    if result_2.into_affine() != expected_2 {
+        println!("  ❌ Scalar=2 MSM failed - BigInt<6> limb ordering issue");
+        return false;
+    }
 
     // Test with larger scalar
     let scalar_large = Fr::from(12345678901234567890u64).into_bigint();
-    let result_large = G1Affine::msm_gpu(&[generator], &[scalar_large])
-        .expect("GPU MSM failed");
+    let scalars_large = ManuallyDrop::new(vec![scalar_large]);
+
+    let result_large = match call_msm(&points, &scalars_large) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ GPU MSM failed for large scalar");
+            return false;
+        }
+    };
 
     let expected_large = (generator * Fr::from(12345678901234567890u64)).into_affine();
 
-    assert_eq!(
-        result_large.into_affine(), expected_large,
-        "BW6-761 Large scalar MSM failed - BigInt<6> limb ordering issue"
-    );
+    if result_large.into_affine() != expected_large {
+        println!("  ❌ Large scalar MSM failed - BigInt<6> limb ordering issue");
+        return false;
+    }
 
-    println!("✅ BW6-761 BigInt<6> layout validated: scalar operations correct");
+    println!("  ✅ PASS - BigInt<6> layout validated");
+    true
 }
 
 /// Test with multiple points to catch subtle layout issues
-///
-/// Strategy: Use multiple points with different coordinates.
-/// If any coordinate is misread, the MSM result will be wrong.
-#[test]
-fn test_bw6_761_multi_point_layout_validation() {
+fn test_bw6_761_multi_point_layout_validation() -> bool {
+    println!("\n=== Test: Multi-point Layout Validation ===");
+
     use ark_std::{UniformRand, test_rng};
 
     let mut rng = test_rng();
     let count = 10;
 
-    // Generate random points
     let points: Vec<G1Affine> = (0..count)
         .map(|_| G1Projective::rand(&mut rng).into_affine())
         .collect();
 
-    // Use scalar = 1 for all (identity for multiplication)
     let scalars: Vec<BigInt<6>> = vec![Fr::from(1u64).into_bigint(); count];
 
-    // GPU MSM with scalar=1 should give sum of points
-    let gpu_result = G1Affine::msm_gpu(&points, &scalars)
-        .expect("Multi-point GPU MSM failed");
+    let points = ManuallyDrop::new(points);
+    let scalars = ManuallyDrop::new(scalars);
+
+    let gpu_result = match call_msm(&points, &scalars) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ Multi-point GPU MSM failed");
+            return false;
+        }
+    };
 
     // CPU reference: sum all points
     let cpu_result: G1Projective = points.iter()
         .map(|&p| G1Projective::from(p))
         .sum();
 
-    assert_eq!(
-        gpu_result.into_affine(),
-        cpu_result.into_affine(),
-        "BW6-761 Multi-point MSM with scalar=1 failed - layout issue in points"
-    );
+    if gpu_result.into_affine() != cpu_result.into_affine() {
+        println!("  ❌ Multi-point MSM with scalar=1 failed - layout issue in points");
+        return false;
+    }
 
-    println!("✅ BW6-761 Multi-point layout validated: coordinates read correctly");
+    println!("  ✅ PASS - Multi-point layout validated");
+    true
 }
 
 /// Test that infinity flag is correctly interpreted
-///
-/// Strategy: Use identity point (infinity = true).
-/// If CUDA misinterprets the infinity flag, results will be wrong.
-#[test]
-fn test_bw6_761_infinity_flag_layout() {
+fn test_bw6_761_infinity_flag_layout() -> bool {
+    println!("\n=== Test: Infinity Flag Layout ===");
+
     let identity = G1Affine::identity();
     let generator = G1Affine::generator();
 
-    // Mix identity and generator
-    let points = vec![identity, generator, identity];
-    let scalars = vec![
+    let points = ManuallyDrop::new(vec![identity, generator, identity]);
+    let scalars = ManuallyDrop::new(vec![
         Fr::from(5u64).into_bigint(),
         Fr::from(3u64).into_bigint(),
         Fr::from(7u64).into_bigint(),
-    ];
+    ]);
+
+    let result = match call_msm(&points, &scalars) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ Infinity flag test MSM failed");
+            return false;
+        }
+    };
 
     // Expected: 5*∞ + 3*G + 7*∞ = 3*G
-    let result = G1Affine::msm_gpu(&points, &scalars)
-        .expect("Infinity flag test failed");
-
     let expected = (generator * Fr::from(3u64)).into_affine();
 
-    assert_eq!(
-        result.into_affine(), expected,
-        "BW6-761 Identity point MSM failed - infinity flag may be misread"
-    );
+    if result.into_affine() != expected {
+        println!("  ❌ Identity point MSM failed - infinity flag may be misread");
+        return false;
+    }
 
-    println!("✅ BW6-761 Infinity flag layout validated: identity points handled correctly");
+    println!("  ✅ PASS - Infinity flag layout validated");
+    true
 }
 
 /// Comprehensive layout validation combining all checks
-#[test]
-fn test_bw6_761_comprehensive_layout_validation() {
+fn test_bw6_761_comprehensive_layout_validation() -> bool {
+    println!("\n=== Test: Comprehensive Layout Validation ===");
+
     use ark_std::{UniformRand, test_rng};
 
     let mut rng = test_rng();
 
-    // Test various point types
-    let points = vec![
-        G1Affine::identity(),          // Infinity flag set
-        G1Affine::generator(),         // Known coordinates
-        G1Projective::rand(&mut rng).into_affine(), // Random point
-    ];
+    let points = ManuallyDrop::new(vec![
+        G1Affine::identity(),
+        G1Affine::generator(),
+        G1Projective::rand(&mut rng).into_affine(),
+    ]);
 
-    // Test various scalar types
-    let scalars = vec![
-        Fr::from(0u64).into_bigint(),   // Zero
-        Fr::from(1u64).into_bigint(),   // One
-        Fr::from(u64::MAX).into_bigint(), // Large value
-    ];
+    let scalars = ManuallyDrop::new(vec![
+        Fr::from(0u64).into_bigint(),
+        Fr::from(1u64).into_bigint(),
+        Fr::from(u64::MAX).into_bigint(),
+    ]);
 
-    // GPU computation
-    let gpu_result = G1Affine::msm_gpu(&points, &scalars)
-        .expect("Comprehensive layout test failed");
+    let gpu_result = match call_msm(&points, &scalars) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ Comprehensive layout test MSM failed");
+            return false;
+        }
+    };
 
     // CPU reference
     let scalars_fr: Vec<Fr> = scalars.iter()
@@ -195,47 +243,45 @@ fn test_bw6_761_comprehensive_layout_validation() {
         .map(|(&p, &s)| G1Projective::from(p) * s)
         .sum();
 
-    assert_eq!(
-        gpu_result.into_affine(),
-        cpu_result.into_affine(),
-        "BW6-761 Comprehensive layout validation failed"
-    );
+    if gpu_result.into_affine() != cpu_result.into_affine() {
+        println!("  ❌ Comprehensive layout validation failed");
+        return false;
+    }
 
-    println!("✅ BW6-761 Comprehensive layout validation passed");
-    println!("   - Point coordinates (761-bit field): ✓");
-    println!("   - Infinity flags: ✓");
-    println!("   - Scalar limbs (BigInt<6>): ✓");
-    println!("   - All field orderings match CUDA expectations");
+    println!("  ✅ PASS - Comprehensive layout validation passed");
+    println!("     - Point coordinates (761-bit field): ✓");
+    println!("     - Infinity flags: ✓");
+    println!("     - Scalar limbs (BigInt<6>): ✓");
+    true
 }
 
 /// Test that validates large field handling
-///
-/// BW6-761's base field is 761 bits (24 x 32-bit limbs), much larger than
-/// BLS12-377's 377 bits (12 limbs). This test ensures the large field
-/// arithmetic is working correctly.
-#[test]
-fn test_bw6_761_large_field_arithmetic() {
+fn test_bw6_761_large_field_arithmetic() -> bool {
+    println!("\n=== Test: Large Field (761-bit) Arithmetic ===");
+
     use ark_std::{UniformRand, test_rng};
 
     let mut rng = test_rng();
 
-    // Generate points with coordinates spanning the full 761-bit field
-    let points: Vec<G1Affine> = (0..5)
+    let points = ManuallyDrop::new((0..5)
         .map(|_| G1Projective::rand(&mut rng).into_affine())
-        .collect();
+        .collect::<Vec<_>>());
 
-    // Use various scalars including large ones
-    let scalars: Vec<BigInt<6>> = vec![
+    let scalars = ManuallyDrop::new(vec![
         Fr::from(1u64).into_bigint(),
         Fr::from(2u64).into_bigint(),
         Fr::from(u64::MAX).into_bigint(),
         Fr::from(u64::MAX - 1).into_bigint(),
         Fr::from(12345u64).into_bigint(),
-    ];
+    ]);
 
-    // GPU MSM
-    let gpu_result = G1Affine::msm_gpu(&points, &scalars)
-        .expect("Large field MSM failed");
+    let gpu_result = match call_msm(&points, &scalars) {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  ❌ Large field MSM failed");
+            return false;
+        }
+    };
 
     // CPU reference
     let scalars_fr: Vec<Fr> = scalars.iter()
@@ -247,11 +293,56 @@ fn test_bw6_761_large_field_arithmetic() {
         .map(|(&p, &s)| G1Projective::from(p) * s)
         .sum();
 
-    assert_eq!(
-        gpu_result.into_affine(),
-        cpu_result.into_affine(),
-        "BW6-761 Large field arithmetic failed"
-    );
+    if gpu_result.into_affine() != cpu_result.into_affine() {
+        println!("  ❌ Large field arithmetic failed");
+        return false;
+    }
 
-    println!("✅ BW6-761 Large field (761-bit) arithmetic validated");
+    println!("  ✅ PASS - Large field (761-bit) arithmetic validated");
+    true
+}
+
+// ============================================================================
+// Main Test Runner (Custom Harness)
+// ============================================================================
+
+fn main() {
+    println!("╔════════════════════════════════════════════════════╗");
+    println!("║  BW6-761 Layout Validation Tests (Custom Harness) ║");
+    println!("╚════════════════════════════════════════════════════╝");
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    let tests: Vec<(&str, fn() -> bool)> = vec![
+        ("test_bw6_761_g1affine_layout_with_generator", test_bw6_761_g1affine_layout_with_generator),
+        ("test_bw6_761_bigint_layout_with_known_scalars", test_bw6_761_bigint_layout_with_known_scalars),
+        ("test_bw6_761_multi_point_layout_validation", test_bw6_761_multi_point_layout_validation),
+        ("test_bw6_761_infinity_flag_layout", test_bw6_761_infinity_flag_layout),
+        ("test_bw6_761_comprehensive_layout_validation", test_bw6_761_comprehensive_layout_validation),
+        ("test_bw6_761_large_field_arithmetic", test_bw6_761_large_field_arithmetic),
+    ];
+
+    for (name, test_fn) in tests {
+        if test_fn() {
+            passed += 1;
+        } else {
+            failed += 1;
+            eprintln!("\n❌ Test failed: {}", name);
+        }
+    }
+
+    println!("\n╔════════════════════════════════════════════════════╗");
+    println!("║  Test Summary                                      ║");
+    println!("╚════════════════════════════════════════════════════╝");
+    println!("  Passed: {}", passed);
+    println!("  Failed: {}", failed);
+
+    if failed == 0 {
+        println!("\n  ✅ ALL TESTS PASSED");
+        std::process::exit(0);
+    } else {
+        println!("\n  ❌ SOME TESTS FAILED");
+        std::process::exit(1);
+    }
 }

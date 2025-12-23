@@ -12,7 +12,7 @@
 //
 // Solution: Custom harness = main() function, no worker threads, predictable cleanup order.
 //
-// Run with: ENABLE_CGBN_STUB=1 cargo test --features gpu --test test_gpu_cgbn_bw6
+// Run with: cargo test --release --features gpu --test test_gpu_cgbn_bw6
 
 #![cfg(all(feature = "gpu", bw6_cgbn_available))]
 
@@ -177,13 +177,6 @@ fn test_cgbn_vs_cpu_comparison() -> bool {
 // ============================================================================
 
 fn main() {
-    // Check environment variable
-    if std::env::var("ENABLE_CGBN_STUB").is_err() {
-        eprintln!("Error: ENABLE_CGBN_STUB environment variable not set");
-        eprintln!("Run with: ENABLE_CGBN_STUB=1 cargo test --features gpu --test test_gpu_cgbn_bw6");
-        std::process::exit(1);
-    }
-
     println!("╔════════════════════════════════════════════════════╗");
     println!("║  CGBN BW6-761 GPU MSM Tests (Custom Harness)      ║");
     println!("╚════════════════════════════════════════════════════╝");

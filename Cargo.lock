@@ -1023,6 +1023,7 @@ dependencies = [
  "serial_test 2.0.0",
  "sha2",
  "sp1-sdk",
+ "sppark-msm",
  "subtle",
  "test-artifacts",
  "thiserror 1.0.69",
@@ -6252,6 +6253,18 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sppark-msm"
+version = "0.1.0"
+dependencies = [
+ "ark-bls12-377",
+ "ark-bw6-761",
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-std 0.5.0",
+ "cc",
 ]
 
 [[package]]
