@@ -2,30 +2,26 @@
 
 use ark_ec::pairing::{Pairing, PairingOutput};
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{One, PrimeField};
+use ark_ff::One;
 use ark_groth16::{Proof as Groth16Proof, VerifyingKey as Groth16VK};
-use ark_relations::{
-    lc,
-    r1cs::{ConstraintSystemRef, LinearCombination, SynthesisError, Variable},
-};
 
 use crate::adaptor_ve::{prove_adaptor_ve, verify_adaptor_ve, AdaptorVeProof};
 use crate::arming::{arm_columns, ColumnArms, ColumnBases};
 use crate::ct::{serialize_gt, DemP2};
-use crate::dlrep::{verify_b_msm, verify_ties_per_column};
 use crate::error::{Error, Result as PvugcResult};
 use crate::poce::{prove_poce_column, verify_poce_column, PoceColumnProof};
 use crate::ppe::validate_groth16_vk_subgroups;
 pub use crate::ppe::{validate_pvugc_vk_subgroups, PvugcVk};
-use crate::{compute_baked_target, DlrepBProof, DlrepPerColumnTies, OneSidedCommitments};
+use crate::{compute_baked_target, OneSidedCommitments};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::RngCore;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::ops::Neg;
 
 /// Complete PVUGC bundle
 pub struct PvugcBundle<E: Pairing> {
     pub groth16_proof: Groth16Proof<E>,
-    pub dlrep_b: DlrepBProof<E>,
-    pub dlrep_ties: DlrepPerColumnTies<E>,
     pub gs_commitments: OneSidedCommitments<E>,
 }
 
@@ -69,8 +65,6 @@ fn split_statement_only_bases<E: Pairing>(
     if pvugc_vk.b_g2_query.len() < required_bases {
         return Err(Error::MismatchedSizes);
     }
-    pvugc_vk.enforce_isolated_witness_block(total_instance)?;
-    pvugc_vk.enforce_public_residual_safe(public_inputs)?;
 
     let mut aggregate = pvugc_vk.beta_g2.into_group();
     aggregate += pvugc_vk.b_g2_query[0].into_group();
@@ -91,6 +85,72 @@ fn split_statement_only_bases<E: Pairing>(
         .collect();
 
     Ok((aggregate.into_affine(), witness_bases))
+}
+
+/// Defensive audit for *published* statement-only bases used by arming/decap.
+///
+/// This catches practical footguns that do **not** require solving DLP:
+/// - identity bases (degenerate)
+/// - duplicates / negated duplicates (publicly known linear relations)
+/// - y_col == ±delta (publicly known linear relation with the δ leg)
+fn audit_statement_only_bases_for_publication<E: Pairing>(bases: &ColumnBases<E>) -> PvugcResult<()> {
+    // Always require subgroup validity and non-zero delta.
+    bases.validate_subgroups()?;
+
+    if bases.y_cols.is_empty() {
+        return Err(Error::MismatchedSizes);
+    }
+    // NOTE: It is common for Groth16 `b_g2_query` to contain identity points for columns that
+    // never appear in the B-polynomials. These witness columns are safe to publish as identities
+    // (they arm to identity and contribute nothing).
+    //
+    // However, the *public aggregated leg* (index 0) being identity is a much stronger and
+    // unexpected degeneracy for statement binding, so we fail-closed on that case.
+    if bases.y_cols[0].is_zero() {
+        return Err(Error::Crypto("zero_public_y_col".to_string()));
+    }
+
+    let delta = bases.delta;
+    if delta.is_zero() {
+        return Err(Error::ZeroDelta);
+    }
+    let delta_neg = delta.into_group().neg().into_affine();
+
+    let hash_g2 = |g: &E::G2Affine| -> [u8; 32] {
+        let mut buf = Vec::new();
+        g.serialize_compressed(&mut buf).expect("serialize");
+        Sha256::digest(&buf).into()
+    };
+
+    let delta_h = hash_g2(&delta);
+    let delta_neg_h = hash_g2(&delta_neg);
+
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut seen_neg: HashSet<[u8; 32]> = HashSet::new();
+
+    for (idx, y) in bases.y_cols.iter().enumerate() {
+        // Skip identity witness columns (idx >= 1). Multiple zeros are fine and expected.
+        if idx != 0 && y.is_zero() {
+            continue;
+        }
+
+        let h = hash_g2(y);
+        if h == delta_h || h == delta_neg_h {
+            return Err(Error::Crypto(format!("y_col_eq_pm_delta_at_index_{}", idx)));
+        }
+        if !seen.insert(h) {
+            return Err(Error::Crypto(format!("duplicate_y_col_at_index_{}", idx)));
+        }
+        // Also ban y_i == -y_j (publicly known relation).
+        let y_neg = y.into_group().neg().into_affine();
+        let h_neg = hash_g2(&y_neg);
+        if seen_neg.contains(&h) {
+            return Err(Error::Crypto(format!("negated_duplicate_y_col_at_index_{}", idx)));
+        }
+        seen_neg.insert(h_neg);
+    }
+
+    Ok(())
 }
 
 /// Optional verification limits
@@ -162,6 +222,8 @@ impl OneSidedPvugc {
             return Err(Error::Crypto("R_is_identity".to_string()));
         }
         let bases = Self::build_column_bases(pvugc_vk, vk, public_inputs)?;
+        // Strict publication audit: prevent trivial linear relations / degeneracy.
+        audit_statement_only_bases_for_publication(&bases)?;
         let col_arms = arm_columns(&bases, rho)?;
         let k = Self::compute_r_to_rho(&r_baked, rho);
         Ok((bases, col_arms, r_baked, k))
@@ -290,9 +352,9 @@ impl OneSidedPvugc {
         }
     }
 
-    /// Verify PoCE-B key-commitment (decap-time, decapper-local)
+    /// Verify DEM tag (decap-time, decapper-local)
     ///
-    /// Verifies that ciphertext is key-committed to the derived key using DEM-Poseidon
+    /// Verifies that ciphertext tag matches derived key using DEM-Poseidon
     pub fn verify_key_commitment<E: Pairing>(
         derived_m: &PairingOutput<E>, // R^ρ derived from attestation
         ctx_hash: &[u8],              // Context hash
@@ -316,7 +378,7 @@ impl OneSidedPvugc {
         crate::ct::verify_key_commitment(&k_bytes, &ad_core, ct_i, &tau_array)
     }
 
-    /// Compute PoCE-B key-commitment tag for a ciphertext (deposit-time helper)
+    /// Compute DEM tag for a ciphertext (deposit-time helper)
     ///
     /// τ = Poseidon("PVUGC/DEM/tag" || K || ad_digest || ct), where K is derived from R^ρ
     pub fn compute_key_commitment_tag_for_ciphertext<E: Pairing>(
@@ -393,34 +455,8 @@ impl OneSidedPvugc {
                 Ok(split) => split,
                 Err(_) => return false,
             };
-        let b_prime =
-            (bundle.groth16_proof.b.into_group() - public_b_leg.into_group()).into_affine();
 
-        // Verify over witness columns only
-        let dlrep_b_ok =
-            verify_b_msm::<E>(b_prime, &witness_bases, pvugc_vk.delta_g2, &bundle.dlrep_b);
-        if !dlrep_b_ok {
-            return false;
-        }
-
-        // 3. Verify per-column same-scalar ties over G1 for variable columns only
-        let a = bundle.groth16_proof.a;
-        // x_cols for variable B-columns align with witness bases → skip aggregated column 0
-        let mut x_cols: Vec<E::G1Affine> =
-            Vec::with_capacity(bundle.gs_commitments.x_b_cols.len().saturating_sub(1));
-        for (i, (x0, _)) in bundle.gs_commitments.x_b_cols.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            x_cols.push(*x0);
-        }
-        let ties_ok =
-            verify_ties_per_column::<E>(a, &x_cols, &bundle.dlrep_ties, bundle.dlrep_b.commitment);
-        if !ties_ok {
-            return false;
-        }
-
-        // 4. Subgroup/identity checks on commitments (allow zero limbs, enforce subgroup when non-zero)
+        // 2. Subgroup/identity checks on commitments (allow zero limbs, enforce subgroup when non-zero)
         {
             use ark_ec::PrimeGroup;
             use ark_ff::PrimeField;
@@ -447,7 +483,7 @@ impl OneSidedPvugc {
             }
         }
 
-        // 5. Verify PPE equals R_baked(vk,x) using direct column pairing
+        // 3. Verify PPE equals R_baked(vk,x) using direct column pairing
         // Use BAKED target computation
         let r_baked = match compute_baked_target(vk, pvugc_vk, public_inputs) {
             Ok(r) => r,
@@ -587,7 +623,7 @@ impl OneSidedPvugc {
         crate::ct::compute_key_commitment_tag(&k_bytes, ad_core, ciphertext)
     }
 
-    /// Verify key-commitment tag (PoCE-B check)
+    /// Verify DEM tag (key-commitment check)
     pub fn verify_key_commitment_dem<E: Pairing>(
         derived_m: &PairingOutput<E>,
         ad_core: &[u8],
@@ -599,28 +635,3 @@ impl OneSidedPvugc {
     }
 }
 
-/// Ensure that every public input (including the implicit 1-wire)
-/// participates in at least one C-column entry.
-pub fn enforce_public_inputs_are_outputs<F: PrimeField>(
-    cs: ConstraintSystemRef<F>,
-) -> Result<(), SynthesisError> {
-    if cs.is_none() {
-        return Ok(());
-    }
-
-    let one_lc: LinearCombination<F> = lc!() + (F::one(), Variable::One);
-    cs.enforce_constraint(one_lc.clone(), one_lc.clone(), one_lc.clone())?;
-
-    let num_instance = cs.num_instance_variables();
-    if num_instance <= 1 {
-        return Ok(());
-    }
-
-    for idx in 1..num_instance {
-        let var = Variable::Instance(idx);
-        let lc_var: LinearCombination<F> = lc!() + var;
-        cs.enforce_constraint(lc_var.clone(), one_lc.clone(), lc_var)?;
-    }
-
-    Ok(())
-}

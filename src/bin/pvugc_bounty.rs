@@ -6,8 +6,7 @@ use ark_crypto_primitives::sponge::{
     poseidon::{constraints::PoseidonSpongeVar, PoseidonSponge as PoseidonSpongeNative},
     CryptographicSponge,
 };
-use ark_ec::AffineRepr;
-use ark_groth16::r1cs_to_qap::LibsnarkReduction;
+use ark_groth16::r1cs_to_qap::PvugcReduction;
 use ark_groth16::{Groth16, ProvingKey as Groth16ProvingKey, VerifyingKey as Groth16VerifyingKey};
 use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, uint8::UInt8};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
@@ -20,20 +19,13 @@ use k256::{Scalar, U256};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256}; // Added for .zero()
 
-use arkworks_groth16::api::enforce_public_inputs_are_outputs;
 use arkworks_groth16::poseidon_fr381_t3::{
     absorb_bytes_native_fr, absorb_bytes_var_fr, POSEIDON381_PARAMS_T3_V1,
 };
 use arkworks_groth16::ppe::PvugcVk;
-use arkworks_groth16::{ColumnArms, OneSidedCommitments, OneSidedPvugc, SimpleCoeffRecorder};
+use arkworks_groth16::{ColumnArms, OneSidedPvugc};
 
 const DEFAULT_PACKAGE_PATH: &str = "bounty_package.bin";
-
-// === Shared helpers (mirroring tests/test_btc_kdf.rs) =======================
-
-fn commitments_from_recorder(recorder: &SimpleCoeffRecorder<E>) -> OneSidedCommitments<E> {
-    recorder.build_commitments()
-}
 
 /// Serialize bounty package (address, statement hash, proving key, column arms, ciphertexts, tags) to disk.
 fn write_bounty_package(
@@ -204,7 +196,6 @@ impl ConstraintSynthesizer<Fr> for PreimageCircuit {
         let hash_computed = sponge.squeeze_field_elements(1)?[0].clone();
 
         hash_var.enforce_equal(&hash_computed)?;
-        enforce_public_inputs_are_outputs(cs)?;
         Ok(())
     }
 }
@@ -234,10 +225,12 @@ fn arm(passphrase: &str, ctx: &str, path: PathBuf) {
     };
     let mut os_rng = OsRng;
     let (pk, vk) =
-        Groth16::<E, LibsnarkReduction>::circuit_specific_setup(circuit, &mut os_rng).unwrap();
+        Groth16::<E, PvugcReduction>::circuit_specific_setup(circuit, &mut os_rng).unwrap();
     // Use pairing::Pairing trait to access G1Affine type
     use ark_ec::pairing::Pairing;
-    let q_dummy = vec![<E as Pairing>::G1Affine::zero(); vk.gamma_abc_g1.len()];
+    use ark_ec::pairing::PairingOutput;
+    use ark_ff::Field;
+    let q_dummy = vec![PairingOutput(<<E as Pairing>::TargetField as Field>::ONE); vk.gamma_abc_g1.len()];
     let pvugc_vk = PvugcVk::new_with_all_witnesses_isolated(
         vk.beta_g2,
         vk.delta_g2,
@@ -316,16 +309,13 @@ fn decap(passphrase: &str, ctx: &str, path: PathBuf) {
     };
 
     let mut rng = OsRng;
-    let mut recorder = SimpleCoeffRecorder::<E>::new();
-    recorder.set_num_instance_variables(vk.gamma_abc_g1.len());
-    let proof =
-        Groth16::<E>::create_random_proof_with_hook(circuit, &pk, &mut rng, &mut recorder).unwrap();
-    let ok = Groth16::<E, LibsnarkReduction>::verify(&vk, &[h_pkg], &proof).unwrap();
+    let (proof, commitments, _assignment, _s) = 
+        arkworks_groth16::decap::prove_and_build_commitments(&pk, circuit, &mut rng).unwrap();
+    let ok = Groth16::<E, PvugcReduction>::verify(&vk, &[h_pkg], &proof).unwrap();
     if !ok {
         eprintln!("DECAP: Groth16 preimage proof verification failed");
         std::process::exit(1);
     }
-    let commitments = commitments_from_recorder(&recorder);
 
     // Decap: derive each K via OneSidedPvugc::decapsulate and recover the shares
     let mut recovered = Scalar::ZERO;

@@ -5,12 +5,10 @@ use ark_ec::pairing::Pairing;
 use ark_ff::{One, Zero};
 use ark_groth16::Groth16;
 use ark_r1cs_std::alloc::AllocVar;
+use ark_snark::SNARK;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
-use ark_relations::r1cs::{
-    ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, SynthesisError,
-};
-use arkworks_groth16::api::enforce_public_inputs_are_outputs;
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use arkworks_groth16::ppe::{compute_groth16_target, extract_y_bases, PvugcVk};
 
 #[derive(Clone)]
@@ -31,7 +29,6 @@ impl ConstraintSynthesizer<Fr> for TestCircuit {
         let y_squared = &y * &y;
         x.enforce_equal(&y_squared)?;
 
-        enforce_public_inputs_are_outputs(cs)?;
         Ok(())
     }
 }
@@ -49,11 +46,12 @@ fn test_constant_one_is_public() {
     // Generate CRS
     let (pk, vk) = Groth16::<E>::circuit_specific_setup(circuit, &mut rng).unwrap();
 
-    let pvugc_vk = PvugcVk::<E> {
-        beta_g2: vk.beta_g2,
-        delta_g2: vk.delta_g2,
-        b_g2_query: std::sync::Arc::new(pk.b_g2_query.clone()),
-    };
+    let pvugc_vk: PvugcVk<E> = PvugcVk::new_with_all_witnesses_isolated(
+        vk.beta_g2,
+        vk.delta_g2,
+        pk.b_g2_query.clone(),
+        vec![],
+    );
 
     let y_bases = extract_y_bases(&pvugc_vk);
 
@@ -102,19 +100,6 @@ fn test_degenerate_target_rejected() {
 }
 
 #[test]
-fn test_enforce_public_outputs_prevents_floating_one() {
-    let cs = ConstraintSystem::<Fr>::new_ref();
-    cs.set_optimization_goal(ark_relations::r1cs::OptimizationGoal::Constraints);
-
-    let _x1 = cs.new_input_variable(|| Ok(Fr::from(10u64))).unwrap();
-    let _x2 = cs.new_input_variable(|| Ok(Fr::from(20u64))).unwrap();
-
-    enforce_public_inputs_are_outputs(cs.clone()).unwrap();
-
-    assert!(cs.num_constraints() >= 3);
-}
-
-#[test]
 fn test_gamma_g2_rejection() {
     use ark_std::rand::SeedableRng;
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(3);
@@ -126,11 +111,12 @@ fn test_gamma_g2_rejection() {
 
     let (pk, vk) = Groth16::<E>::circuit_specific_setup(circuit, &mut rng).unwrap();
 
-    let pvugc_vk = PvugcVk::<E> {
-        beta_g2: vk.beta_g2,
-        delta_g2: vk.delta_g2,
-        b_g2_query: std::sync::Arc::new(pk.b_g2_query.clone()),
-    };
+    let pvugc_vk: PvugcVk<E> = PvugcVk::new_with_all_witnesses_isolated(
+        vk.beta_g2,
+        vk.delta_g2,
+        pk.b_g2_query.clone(),
+        vec![],
+    );
 
     let y_bases = extract_y_bases(&pvugc_vk);
 

@@ -18,11 +18,9 @@ pub mod adaptor_ve;
 pub mod api;
 pub mod arming;
 pub mod bitcoin;
-pub mod coeff_recorder;
 pub mod ct;
 pub mod ctx;
 pub mod decap;
-pub mod dlrep;
 pub mod error;
 pub mod io;
 pub mod msm_backend;
@@ -42,22 +40,15 @@ pub mod pvugc_outer;
 pub mod test_circuits; // Shared test circuits
 pub mod test_fixtures; // Shared fixtures with disk caching
 
-// Inner STARK verifier modules
-pub mod stark;
-
-// Re-export STARK types for backward compatibility
-pub use stark::{AirParams, CompQuery, FullStarkVerifierCircuit, TraceQuery, TraceSegmentWitness};
+// SP1 Bridge: Simplified integration for gnark proofs → PVUGC
+pub mod sp1_bridge;
 
 // Re-exports - Public API
 pub use adaptor_ve::{prove_adaptor_ve, verify_adaptor_ve, AdaptorVeProof};
 pub use api::{ColumnArmingAttestation, OneSidedPvugc, PvugcBundle};
 pub use arming::{arm_columns, ColumnArms, ColumnBases};
-pub use coeff_recorder::{BCoefficients, CoefficientRecorder, SimpleCoeffRecorder};
-pub use decap::OneSidedCommitments;
-pub use dlrep::{
-    prove_b_msm, prove_ties_per_column, verify_b_msm, verify_ties_per_column, DlrepBProof,
-    DlrepPerColumnTies,
-};
+pub use decap::{build_commitments, OneSidedCommitments};
+pub use decap::prove_and_build_commitments;
 pub use poce::{prove_poce_column, verify_poce_column, PoceColumnProof};
 pub use ppe::{
     build_one_sided_ppe, compute_baked_target, compute_groth16_target, extract_y_bases, PvugcVk,
@@ -71,7 +62,7 @@ pub use outer_compressed::{
     cycles::{Bls12Bw6Cycle, Mnt4Mnt6Cycle},
     fr_inner_to_outer, fr_inner_to_outer_for, prove_outer, prove_outer_for, setup_outer_params,
     setup_outer_params_for, verify_outer, verify_outer_for, DefaultCycle, InnerE, InnerFr, OuterE,
-    OuterFr, RecursionCycle,
+    OuterFr, RecursionCycle, OuterCircuit,
 };
 
 // Test utilities re-exports

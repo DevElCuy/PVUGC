@@ -1,9 +1,9 @@
-# GT-XPDH Reduction to DDH in G2 (and Generic-Model Bound)
+# GT-XPDH Reduction to DDH in G₂ (and Generic-Model Bound)
 
-This note formalizes the GT-XPDH ("external power in GT") assumption and records:
+This note formalizes the GT-XPDH ("external power in $G_T$") assumption and records:
 
-- a tight black-box reduction from GT-XPDH to DDH in G2, hence that SXDH implies GT-XPDH, and
-- the algebraic generic bilinear group (GBGM) bound of ~O(q^2 / r) (polylog factors in q suppressed) for any adversary making q oracle calls.
+- a tight black-box reduction from GT-XPDH to DDH in G₂, hence that SXDH implies GT-XPDH, and
+- the algebraic generic bilinear group (GBGM) bound of $O(q^2 / r)$ (polylog factors in $q$ suppressed) for any adversary making $q$ oracle calls.
 
 We conclude with the PVUGC "No-Proof-Spend" corollary. All probabilities below are taken over the randomness of both the challenger and the adversary.
 
@@ -11,176 +11,211 @@ We conclude with the PVUGC "No-Proof-Spend" corollary. All probabilities below a
 
 ## Setting
 
-Let (G1, G2, GT, e) be asymmetric prime-order, non-degenerate bilinear groups of order r. Let g1 ∈ G1 and g2 ∈ G2 be generators, and write gT := e(g1, g2) for the induced generator of GT. We assume canonical encodings with efficient equality testing in every group.
+Let $(G_1, G_2, G_T, e)$ be asymmetric prime-order, non-degenerate bilinear groups of order $r$. Let $g_1 \in G_1$ and $g_2 \in G_2$ be generators, and write $g_T := e(g_1, g_2)$ for the induced generator of $G_T$. We assume canonical encodings with efficient equality testing in every group.
 
-SXDH asserts that DDH is hard in both G1 and G2; throughout this document we only rely on the G2-half (DDH in G2).
+SXDH asserts that DDH is hard in both $G_1$ and $G_2$; throughout this document we only rely on the G₂-half (DDH in G₂).
 
 ---
 
-## GT-XPDH (external power in GT)
+<a id="gt-xpdh-definition"></a>
+## GT-XPDH (external power in $G_T$)
 
-Fix m ≥ 0. Sample independently (statement-only) bases Y0, …, Ym, Δ ←R G2, a non-zero exponent ρ ←R Zr*, and R ←R GT. Give the adversary the tuple
+Fix $m \geq 0$. Sample independently (statement-only) bases $Y_0, \ldots, Y_m, \Delta \leftarrow G_2$, a non-zero exponent $\rho \leftarrow Z_r^*$, and $R \leftarrow G_T$. Give the adversary the tuple
 
-( {Yj}j=0..m, Δ, {Yj^ρ}j=0..m, Δ^ρ, R ).
+$$(Y_0, \ldots, Y_m, \Delta, Y_0^\rho, \ldots, Y_m^\rho, \Delta^\rho, R)$$
 
-The adversary succeeds in the computational GT-XPDH game if it outputs R^ρ ∈ GT. In the decisional GT-XPDH-DEC variant the challenger additionally samples b ←R {0,1} and sets
+The adversary succeeds in the computational GT-XPDH game if it outputs $R^\rho \in G_T$. In the decisional GT-XPDH-DEC variant the challenger additionally samples $b \leftarrow (0,1)$ and sets:
 
-W := R^ρ if b = 1, and
-W := U for U ←R GT if b = 0,
+- $W := R^\rho$ if $b = 1$
+- $W := U$ for $U \leftarrow G_T$ if $b = 0$
 
-giving W to the adversary, whose goal is to recover b. The advantages are defined in the usual way: for a computational adversary
+giving $W$ to the adversary, whose goal is to recover $b$. The advantages are defined in the usual way: for a computational adversary
 
-Adv_GT-XPDH(A) := Pr[A outputs R^ρ],
+$$Adv_{GT-XPDH}(A) := Pr[A \to R^\rho]$$
 
 and for a decisional adversary
 
-Adv_GT-XPDH-DEC(A) := |Pr[A outputs 1 | b = 1] − Pr[A outputs 1 | b = 0]|.
+$$Adv_{GT-XPDH-DEC}(A) := |Pr[A \to 1 \mid b=1] - Pr[A \to 1 \mid b=0]|$$
 
 ---
 
+<a id="lemma-1"></a>
 ## Lemma 1 (Uniform "pairing form" of R)
 
-For u ←R Zr* and v ←R Zr, the element
+For $u \leftarrow Z_r^*$ and $v \leftarrow Z_r$, the element
 
-R0 := e(g1^u, g2^v) = gT^{uv}
+$$R_0 := e(g_1^u, g_2^v) = g_T^{uv}$$
 
-is uniform in GT and independent of all other sampled values. Indeed, for any t ∈ Zr,
+is uniform in $G_T$ and independent of all other sampled values. Indeed, for any $t \in Z_r$,
 
-Pr[uv = t] = ∑_{u∈Zr*} Pr[u] · Pr[v = t·u^{-1}] = (r−1)/((r−1)·r) = 1/r,
+$$Pr[uv = t] = \sum_u Pr[u] \cdot Pr[v = t \cdot u^{-1}] = \frac{r-1}{(r-1) \cdot r} = \frac{1}{r}$$
 
-so uv is uniform in Zr, implying that R0 is uniform in GT. Because the samplings of u and v are independent of ρ and of {Yj, Δ}, the value R0 is jointly independent of those elements as required.
+so $uv$ is uniform in $Z_r$, implying that $R_0$ is uniform in $G_T$. Because the samplings of $u$ and $v$ are independent of $\rho$ and of $(Y_j, \Delta)$, the value $R_0$ is jointly independent of those elements as required.
 
-Consequently, the GT-XPDH game is equivalent to the variant in which the challenger sets R = e(g1^u, g2^v) for fresh uniformly random u ∈ Zr*, v ∈ Zr. Moreover, R0 is independent not only of ρ and {Yj, Δ}, but also of their powered forms {Yj^ρ} and Δ^ρ, which are functions of X = g2^ρ and the independently sampled {Yj, Δ}.
+Consequently, the GT-XPDH game is equivalent to the variant in which the challenger sets $R = e(g_1^u, g_2^v)$ for fresh uniformly random $u \in Z_r^*$, $v \in Z_r$. Moreover, $R_0$ is independent not only of $\rho$ and $(Y_j, \Delta)$, but also of their powered forms $(Y_j^\rho)$ and $\Delta^\rho$, which are functions of $X = g_2^\rho$ and the independently sampled $(Y_j, \Delta)$.
 
-### Lemma 2 (Marginal uniformity & conditional independence of the PVUGC anchor)
+<a id="lemma-2"></a>
+### Lemma 2 (Independence of PVUGC anchor from armed bases)
 
-Let (vk, x) be any fixed Groth16 statement with IC(x) ≠ 0, and suppose the CRS is honestly generated by sampling τ, α, β, γ, δ ←R 𝔽_r. Write a := log_{g1}([α]_1), y_β := log_{g2}([β]_2), y_γ := log_{g2}([γ]_2), and IC(x) = g_1^{i_x}. Then
-```
-R(vk, x) = e([α]_1, [β]_2) · e(IC(x), [γ]_2) = g_T^{a·y_β + i_x·y_γ}.
-```
-Because y_γ is uniform and independent of {y_β, {v_j}, δ}, the term i_x·y_γ is uniform whenever i_x ≠ 0; adding the fixed component a·y_β preserves uniformity, and multiplying by a fixed G_T element preserves uniformity as well. Consequently R(vk, x) is uniform in G_T. Moreover, conditioned on the statement-only bases {Y_j}, Δ (which exclude [γ]_2), the distribution of R(vk, x) remains uniform, so R(vk, x) is statistically independent of {Y_j}, Δ and of their ρ-masked forms. This lets us treat the statement-derived anchor as the “R” element inside GT-XPDH despite its structured definition.
+Let $(vk, x)$ be any fixed Groth16 statement. The Groth16 verification target is:
+
+$$R(vk, x) = e(\alpha_1, \beta_2) \cdot e(L(x), \gamma_2)$$
+
+where $L(x) = \sum_i x_i \cdot IC_i$ is the public-input linear combination.
+
+<a id="key-observation"></a>
+**Key observation:** The armed bases $\beta_2^\rho$, $v_{j,2}^\rho$, $\delta_2^\rho$ are derived from $\beta_2$, witness columns, and $\delta_2$. Critically, **$\gamma_2$ is never armed**.
+
+**Independence claim:** Since $\gamma_2$ is not in span(armed bases), the **ρ-armed** component $e(L(x), \gamma_2)^\rho$ (and hence $R(vk,x)^\rho$) cannot be computed from the armed transcript alone. The adversary can pair $\alpha_1$ with armed bases, but these never produce terms involving $\gamma_2^\rho$.
+
+**For the reductions:** In PVUGC, $R(vk,x)$ is a **correlated** (statement-derived) $G_T$ element, so a direct Standard Model reduction that embeds a DDH challenge into $\gamma_2$ is obstructed by the need to simultaneously generate $IC_i = (w_i/\gamma)\cdot G_1$ consistently (the "Inverse Gamma" issue; see [Bridging Correlated (PVUGC) to Random GT-XPDH](#pvu-bridge)). Instead:
+
+- **Structural step (AGBGM):** The independence above is used in the AGBGM to show Correlated GT-XPDH (PVUGC form) is as hard as the Random GT-XPDH game.
+- **Computational step (Standard Model):** Once in the Random GT-XPDH game (with independent random $R$), [Theorem 1](#theorem-1) gives a tight black-box reduction to DDH in $G_2$ by *programming* $R := e(g_1^u, Y)$ from the DDH challenge.
 
 ---
 
-## Theorem 1 (Tight reduction to DDH in G2)
+<a id="theorem-1"></a>
+## Theorem 1 (Tight reduction to DDH in G₂)
 
-Let A be any PPT adversary for GT-XPDH with success probability ε. There exists a PPT algorithm B that solves DDH in G2 with advantage at least ε − 1/r. The reduction is tight: B makes a single black-box call to A and performs only a constant number of pairings.
+Let $A$ be any PPT adversary for GT-XPDH with success probability $\epsilon$. There exists a PPT algorithm $B$ that solves DDH in $G_2$ with advantage at least $\epsilon - 1/r$. The reduction is tight: $B$ makes a single black-box call to $A$ and performs only a constant number of pairings.
 
-### DDH_G2 game
+<a id="ddh-game"></a>
+### DDH in G₂ game
 
-The DDH challenger samples ρ, v ←R Zr, sets X := g2^ρ and Y := g2^v, and returns
+The DDH challenger samples $\rho, v \leftarrow Z_r$, sets $X := g_2^\rho$ and $Y := g_2^v$, and returns
 
-(g2, X, Y, T)
+$$(g_2, X, Y, T)$$
 
-where either T = g2^{ρv} (the Diffie–Hellman case) or T ←R G2 (the random case). The adversary must decide which distribution it received.
+where either $T = g_2^{\rho v}$ (the Diffie–Hellman case) or $T \leftarrow G_2$ (the random case). The adversary must decide which distribution it received.
 
+<a id="construction-b"></a>
 ### Construction of B
 
-Given (g2, X, Y, T) from the DDH challenger:
+Given $(g_2, X, Y, T)$ from the DDH challenger:
 
-1. Embed the exponent. Sample independent coefficients α0, …, αm, αΔ ←R Zr and set
-   Yj := g2^{αj},   Yj^ρ := X^{αj},   Δ := g2^{αΔ},   Δ^ρ := X^{αΔ}.
-   This matches the distribution in the GT-XPDH game because X = g2^ρ.
-2. Program R. Using the lemma, sample u ←R Zr* and set
-   R := e(g1^u, Y) = e(g1^u, g2^v).
-3. Run A. Provide ({Yj}, Δ, {Yj^ρ}, Δ^ρ, R) to A and record its output S.
-4. Decide. Compute
-   T' := e(g1^u, T) ∈ GT
-   and output “DH” if and only if S = T'.
+1. **Embed the exponent.** Sample independent coefficients $\alpha_0, \ldots, \alpha_m, \alpha_\Delta \leftarrow Z_r$ and set
 
+$$Y_j := g_2^{\alpha_j}, \quad Y_j^\rho := X^{\alpha_j}, \quad \Delta := g_2^{\alpha_\Delta}, \quad \Delta^\rho := X^{\alpha_\Delta}$$
+
+This matches the distribution in the GT-XPDH game because $X = g_2^\rho$.
+
+2. **Program R.** Using [Lemma 1](#lemma-1), sample $u \leftarrow Z_r^*$ and set
+
+$$R := e(g_1^u, Y) = e(g_1^u, g_2^v)$$
+
+3. **Run A.** Provide $((Y_j), \Delta, (Y_j^\rho), \Delta^\rho, R)$ to $A$ and record its output $S$.
+
+4. **Decide.** Compute
+
+$$T' := e(g_1^u, T) \in G_T$$
+
+and output "DH" if and only if $S = T'$.
+
+<a id="correctness"></a>
 ### Correctness analysis
 
-- If T = g2^{ρv}, then
-  T' = e(g1^u, g2^{ρv}) = e(g1^u, g2^{v})^ρ = R^ρ.
-  Hence S = T' exactly when A solves the GT-XPDH instance, which occurs with probability ε.
-- If T ←R G2, then by bilinearity T' = e(g1^u, T) is uniform in GT and independent of S (since S = R^ρ). Therefore Pr[S = T'] = 1/r.
+- If $T = g_2^{\rho v}$, then $T' = e(g_1^u, g_2^{\rho v}) = e(g_1^u, g_2^v)^\rho = R^\rho$. Hence $S = T'$ exactly when $A$ solves the GT-XPDH instance, which occurs with probability $\epsilon$.
 
-The distinguishing advantage of B is thus at least ε − 1/r. Consequently DDH hardness in G2 implies both the computational and decisional variants of GT-XPDH.
+- If $T \leftarrow G_2$, then by bilinearity $T' = e(g_1^u, T)$ is uniform in $G_T$ and independent of $S$ (since $S = R^\rho$). Therefore $Pr[S = T'] = 1/r$.
 
+The distinguishing advantage of $B$ is thus at least $\epsilon - 1/r$. Consequently DDH hardness in $G_2$ implies both the computational and decisional variants of GT-XPDH.
+
+<a id="correlated-gt-xpdh"></a>
 ### Correlated GT-XPDH (PVUGC form)
 
-PVUGC never samples an independent random R; instead it derives
-```
-R(vk, x) = e([α]_1, [β]_2) · e(IC(x), [γ]_2)
-```
+PVUGC never samples an independent random $R$; instead it derives
+
+$$R(vk, x) = e(\alpha_1, \beta_2) \cdot e(IC(x), \gamma_2)$$
+
 from the verifying key and public input. The protocol enforces five guardrails:
 
-1. `[γ]_2` never appears among the armed bases (only the aggregated public B-column, witness-only B columns, and `[δ]_2` are armed).
-2. Every public input wire participates in a non-zero C-column so that IC(x) ≠ 0.
-3. CRS hygiene holds: `[γ]_2 ∉ span{[β]_2, b_g2_query, [δ]_2}`.
-4. Each arming uses a fresh exponent ρ.
-5. Never arm any G₁ element (arming U^ρ would reveal e(U, [γ]_2)^ρ via public pairings).
+<a id="guardrails"></a>
+1. $\gamma_2$ never appears among the armed bases (only the aggregated public B-column, witness-only B columns, and $\delta_2$ are armed).
+2. Every public input wire participates in a non-zero C-column so that $IC(x) \neq 0$.
+3. CRS hygiene holds: $\gamma_2$ is not in span($\beta_2$, $b_{g2query}$, $\delta_2$).
+4. Each arming uses a fresh exponent $\rho$.
+5. Never arm any $G_1$ element (arming $U^\rho$ would reveal $e(U, \gamma_2)^\rho$ via public pairings).
 
-Under these conditions Lemma 2 applies: the anchor is marginally uniform and independent of the armed bases. We therefore define the **correlated GT-XPDH game** exactly as PVUGC does: {Y_j} and Δ are derived from (vk, x) under the guardrails, the challenger samples ρ and publishes {Y_j^ρ}, Δ^ρ, and sets R = R(vk, x). An adversary wins if it outputs R^ρ.
+These guardrails are the reduction-level restatement of the Lean-CRS / baked-quotient architecture in [algebraic_framework.md](algebraic_framework.md): public inputs bound in the C-matrix only ($u_{pub} = v_{pub} = 0$, $w_{pub} \neq 0$), W-span separation between public and witness C-rows, and the explicit exclusion of any armed $\gamma_2$ handle.
 
-### Theorem 1′ (Tight DDH reduction for the correlated game)
+Under these conditions, **$R(vk, x)$ contains a factor $e(L(x), \gamma_2)$ that cannot be computed from the armed transcript** since $\gamma_2^\rho$ is never published ([Lemma 2](#lemma-2)). We define the **correlated GT-XPDH game** as: armed bases $\beta_2^\rho$, $v_{j,2}^\rho$, $\delta_2^\rho$ are derived from $(vk, x)$ under the guardrails, the challenger samples $\rho$, and sets $R = R(vk, x)$. An adversary wins if it outputs $R^\rho$.
 
-Let A break the correlated GT-XPDH game with advantage ε. Construct B against DDH in G2 just as before, except that:
+<a id="pvu-bridge"></a>
+### Bridging Correlated (PVUGC) to Random GT-XPDH
 
-1. Embed the DDH challenge element Y = g2^v as `[γ]_2` inside the CRS (this is consistent with the hygiene rule).
-2. Program `[α]_1 = g1^u` with u ←R Z_r^* and keep the public input x fixed so IC(x) is known.
-3. Publish the armed transcript derived from vk along with R(vk, x) = e(g1^u, [β]_2) · e(IC(x), Y). (The simulator can compute `[β]_2^{ρ}` as X^{b} because it chose `[β]_2 = g_2^{b}` and the DDH challenger supplies X = g_2^{ρ}`.)
+A direct Standard Model reduction from the Correlated Game (PVUGC) to DDH is obstructed by the **Inverse Gamma ($\gamma^{-1}$)** problem: embedding a DDH challenge into $\gamma$ prevents the simulator from generating the Verification Key terms $IC_i = \frac{w_i}{\gamma} \cdot G_1$.
 
-If the DDH challenge is real (T = g2^{ρv}), then
-```
-R(vk, x)^ρ = e(g1^u, [β]_2)^ρ · e(IC(x), Y)^ρ = e(g1^u, [β]_2^ρ) · e(IC(x), T),
-```
-and A’s output lets B compare against e(IC(x), T) exactly as in Theorem 1 after cancelling the known `[β]_2^ρ` term. If the challenge is random, the comparison succeeds only with probability 1/r. Thus B decides DDH with advantage at least ε − 1/r, showing that SXDH implies security for PVUGC even in the correlated setting.
+However, the security relies on the **Algebraic Generic Bilinear Group Model (AGBGM)** to bridge this gap:
+
+1. **Algebraic Independence (AGBGM):**
+   The AGBGM analysis (see [Theorem 2](#theorem-2)) proves that the algebraic span of the $IC_i$ elements is orthogonal to the $\rho$-armed target components. Specifically:
+   - $IC_i$ contains $\gamma^{-1}$ but no $\rho$.
+   - Armed handles contain $\rho$ but no $\gamma$.
+   - No pairing operation can mix them to form the target's $\rho \cdot \gamma^{-1}$ structure.
+
+   Therefore, in the generic model, the **Correlated GT-XPDH** game is strictly as hard as the **Random GT-XPDH** game.
+
+2. **Computational Hardness (Standard Model):**
+   Combining this with [Theorem 1](#theorem-1), we obtain the final security claim:
+
+   > **Result:** Any adversary breaking PVUGC in the AGBGM implies a solver for DDH in $G_2$ (Standard Model) with tight advantage.
+
+This hybrid argument uses the AGBGM to handle the structural properties of the Setup (the $1/\gamma$ barrier) and DDH to characterize the cryptographic hardness of the Arming ($\rho$).
 
 ---
 
+<a id="theorem-2"></a>
 ## Theorem 2 (Algebraic GBGM bound)
 
-In the algebraic generic bilinear group model, let A issue at most q oracle queries (group operations in G1, G2, GT, and pairings). Then
+In the algebraic generic bilinear group model, let $A$ issue at most $q$ oracle queries (group operations in $G_1$, $G_2$, $G_T$, and pairings). Then
 
-Adv_GT-XPDH(A) ≤ ~O(q^2 / r).
+$$Adv_{GT-XPDH}(A) \leq O(q^2 / r)$$
 
-Sketch. Assign formal indeterminates a, i_x to the G₁ sources and y_β, y_γ, y_δ, {y_j} to the G₂ sources. Every GT handle maintained by A is labeled with an explicit polynomial E_H in these variables. Pairing with a masked right leg Y^ρ ∈ {B_pub^ρ, Q_j^ρ (j>ℓ), δ_2^ρ} contributes a monomial of the form ρ·L(U)·y_* (degree ≤ 3), where L(U) is the linear form describing the left leg U ∈ G₁ and y_* ∈ {y_pub, y_j (j>ℓ), y_δ}. Operations inside G_T add such polynomials and scale them by known integers, so the ρ-bearing part of any reachable E_H lies in
+**Sketch.** Assign formal indeterminates $a$, $i_x$ to the $G_1$ sources and $y_\beta$, $y_\gamma$, $y_\delta$, $y_j$ to the $G_2$ sources. Every $G_T$ handle maintained by $A$ is labeled with an explicit polynomial $E_H$ in these variables. Pairing with a masked right leg $Y^\rho$ (one of $\beta_2^\rho$, $v_{j,2}^\rho$, $\delta_2^\rho$) contributes a monomial of the form $\rho \cdot L(U) \cdot y$ (degree ≤ 3), where $L(U)$ is the linear form describing the left leg $U$ in $G_1$ and $y$ is one of $y_\beta$, $y_j$ (for $j > \ell$), or $y_\delta$. Operations inside $G_T$ add such polynomials and scale them by known integers, so the $\rho$-bearing part of any reachable $E_H$ lies in
 
-    ρ · span{ y_pub, y_j (j>ℓ), y_δ }
+$$\rho \cdot span(y_\beta, y_j, y_\delta)$$
 
-and never includes a ρ·y_γ term. The target exponent is E_* = ρ·r_* = ρ·(a·y_β + i_x·y_γ), whose ρ·y_γ coefficient equals i_x ≠ 0 for valid statements. Therefore E_H = E_* can hold only via an accidental algebraic equality among the ≤ q produced handles. The standard algebraic/generic-group collision analysis (Schwartz–Zippel style) bounds this probability by ~O(q^2 / r). ∎
+where $j > \ell$, and never includes a $\rho \cdot y_\gamma$ term. The target exponent is $E = \rho \cdot r = \rho \cdot (a \cdot y_\beta + i_x \cdot y_\gamma)$, whose $\rho \cdot y_\gamma$ coefficient equals $i_x \neq 0$ for valid statements. Therefore $E_H = E$ can hold only via an accidental algebraic equality among the ≤ $q$ produced handles. The standard algebraic/generic-group collision analysis (Schwartz–Zippel style) bounds this probability by $O(q^2 / r)$. ∎
 
 ---
 
+<a id="corollary"></a>
 ## Corollary (PVUGC No-Proof-Spend)
 
-Fix a statement (vk, x). Let the statement-only bases {Yj}, Δ be derived from vk (excluding γ2), and require an accepting DLREP+GS attestation before any G1 witnesses may appear inside pairings. For a fresh exponent ρi sampled per armer, and given only the public data ({Yj^{ρi}}, Δ^{ρi}, R(vk, x)), computing
+Fix a statement $(vk, x)$. Let the statement-only bases $(Y_j)$, $\Delta$ be derived from $vk$ (excluding $\gamma_2$), and require an accepting GS attestation before any $G_1$ witnesses may appear inside pairings. For a fresh exponent $\rho_i$ sampled per armer, and given only the public data $((Y_j^{\rho_i}), \Delta^{\rho_i}, R(vk, x))$, computing
 
-Mi := R(vk, x)^{ρi}
+$$M_i := R(vk, x)^{\rho_i}$$
 
 without an accepting attestation is infeasible:
 
-- GBGM: the success probability is at most ~O(q^2 / r).
-- SXDH / DDH in G2: any PPT adversary for the computation gives a PPT DDH_G2 solver with essentially the same advantage (Theorem 1).
+- **GBGM:** the success probability is at most $O(q^2 / r)$ (see [Theorem 2](#theorem-2)).
+- **SXDH / DDH in G₂:** any PPT adversary for the computation gives a PPT DDH solver in G₂ with essentially the same advantage (see [Theorem 1](#theorem-1)).
 
-Consequently the PVUGC key Ki = Hash(ser_GT(Mi) ∥ …) remains hidden and the adaptor cannot be finalized without producing a valid attestation.
+Consequently the PVUGC key $K_i = Hash(ser_{G_T}(M_i) \| \ldots)$ remains hidden and the adaptor cannot be finalized without producing a valid attestation.
 
 ---
 
+<a id="self-decapper"></a>
 ## Self-decapper resistance
 
-**Security dependency.** Resistance to “self-decapper” attacks does **not** rely on the DLREP constraints. Under public-(B) aggregation, $[\gamma]_2$ exclusion, and public-output coverage, let
-$$
-T := \left(\prod_{j=0}^{n_B-1} e(X^{(B)}_j, Y_j)\right) \cdot e(X^{(B)}_\delta, [\delta]_2)
-$$
-be the publicly evaluable B-leg aggregation. Any tuple that makes GS-PPE hold without a valid Groth16 proof must solve
-$$
-e(C, [\delta]_2) = R(\mathsf{vk}, x) \cdot T^{-1},
-$$
-i.e., discrete logarithm in $\mathbb{G}_T$. Therefore a “self-decapper” would have to solve discrete logarithms across the pairing (e.g., recover $z = \log_{g_T}(R \cdot T^{-1})$ and either $\log_{g_2}([\delta]_2)$ or $\log_{g_1}(C)$) even if DLREP checks were omitted; DLREP soundness simply ensures that honest proofs satisfy the PPE.
+**Security dependency.** With public inputs in C-matrix only ($v_{pub} = 0$), $\gamma_2$ is excluded from armed bases. The PPE constraint ensures that honest proofs satisfy the verification equation.
+
+**Key observation:** Statement binding is through $R(vk, x)$ which includes $e(L(x), \gamma_2)$ where $L(x) = \sum x_i \cdot IC_i$ and $IC_i = w_i/\gamma$. Since $\gamma_2$ is never armed, the adversary cannot compute $R^\rho$ without producing a valid Groth16 proof.
+
+This reduces to **DDH in G₂** via the AGBGM bridge: the algebraic independence of $\gamma^{-1}$ from $\rho$-armed handles (see [Bridging section](#pvu-bridge)) combined with the tight DDH reduction for random GT-XPDH (see [Theorem 1](#theorem-1)).
 
 ---
 
-## Note on “DLIP” (target-group assumptions)
+## Note on "DLIP" (target-group assumptions)
 
-The above results do not rely on any additional GT-side assumptions. One may still cite target-group assumptions such as GT-DLIN/DLIP when considering alternate formulations in which R is algebraically derived from public GT combinations, but they are unnecessary for the GT-XPDH formulation used here (in which R is uniform and independent).
+The above results do not rely on any additional $G_T$-side assumptions. One may still cite target-group assumptions such as GT-DLIN/DLIP when considering alternate formulations in which $R$ is algebraically derived from public $G_T$ combinations, but they are unnecessary for the GT-XPDH formulation used here (in which $R$ is uniform and independent).
 
 ---
 
 ## Summary
 
-- GT-XPDH tightly reduces to DDH in G2; thus SXDH (using only the G2 half) suffices.
-- In the algebraic GBGM the success probability is bounded by ~O(q^2 / r).
-- PVUGC’s No-Proof-Spend property follows directly under these standard assumptions.
-
+- **Random GT-XPDH → DDH:** GT-XPDH (with random $R$) tightly reduces to DDH in G₂ in the Standard Model (see [Theorem 1](#theorem-1)); thus SXDH (using only the G₂ half) suffices.
+- **Correlated → Random (AGBGM):** The Correlated GT-XPDH game (PVUGC's statement-derived $R$) reduces to Random GT-XPDH via algebraic independence in the AGBGM (see [Bridging section](#pvu-bridge)). A direct Standard Model reduction is blocked by the Inverse Gamma ($\gamma^{-1}$) problem.
+- **GBGM bound:** The algebraic success probability is bounded by $O(q^2 / r)$ (see [Theorem 2](#theorem-2)).
+- **PVUGC security:** The No-Proof-Spend property follows from the two-step chain: PVUGC →(AGBGM)→ GT-XPDH →(Standard Model)→ DDH (see [Corollary](#corollary)).
