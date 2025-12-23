@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 gpu = []
+bw6_generic = []  # Enable broken generic BW6-761 kernel (hangs due to register pressure)
 
 [dependencies]
 ark-bls12-377 = "0.5"
@@ -16,3 +17,9 @@ ark-std = "0.5"
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"] }
+
+# Custom test harness for CGBN tests (avoids Rust test framework CUDA cleanup conflicts)
+[[test]]
+name = "test_gpu_cgbn_bw6"
+path = "tests/test_gpu_cgbn_bw6.rs"
+harness = false

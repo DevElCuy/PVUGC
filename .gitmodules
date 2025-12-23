@@ -2,3 +2,6 @@
 	path = sppark-msm/sppark
 	url = https://github.com/DevElCuy/sppark
 	branch = v0.1.14
+[submodule "cgbn-lib"]
+	path = cgbn-lib
+	url = https://github.com/NVlabs/CGBN.git

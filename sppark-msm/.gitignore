@@ -1,0 +1,25 @@
+# Compiled test binaries
+test_minimal
+test_real_points
+test_montgomery_conversion
+standalone_cgbn_test
+standalone_cgbn_empty_test
+test_cgbn_edge_cases
+test_cgbn_kernel_standalone
+test_cgbn_standalone
+tests/test_cgbn_point_add
+
+# Valgrind core dumps
+vgcore.*
+
+# One-off debug/test files
+standalone_cgbn_test.cpp
+standalone_cgbn_empty_test.cpp
+test_minimal_kernel.cu
+test_montgomery_conversion.cu
+test_real_points.cpp
+test_real_points.cu
+extract_montgomery_constants.rs
+
+# Debug examples
+examples/

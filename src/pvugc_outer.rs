@@ -24,7 +24,67 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::time::Instant;
 
+// GPU MSM support via CGBN kernel
+#[cfg(feature = "gpu")]
+use sppark_msm::msm_bw6_761_gpu_cgbn;
+
 type StatementVec<C> = Vec<InnerScalar<C>>;
+
+/// Perform MSM with GPU acceleration when available for BW6-761.
+/// Falls back to CPU for other curves or when GPU is unavailable.
+#[cfg(feature = "gpu")]
+fn msm_with_gpu_fallback<E: Pairing>(
+    bases: &[E::G1Affine],
+    scalars: &[E::ScalarField],
+) -> E::G1 {
+    use std::any::TypeId;
+
+    // Check if this is BW6-761 (the outer curve for BLS12-377/BW6-761 cycle)
+    if TypeId::of::<E>() == TypeId::of::<ark_bw6_761::BW6_761>() {
+        // Convert to concrete types for GPU kernel
+        // SAFETY: We verified the type above
+        let bases_bw6: &[ark_bw6_761::G1Affine] = unsafe {
+            std::slice::from_raw_parts(
+                bases.as_ptr() as *const ark_bw6_761::G1Affine,
+                bases.len(),
+            )
+        };
+
+        // Convert scalars to BigInt<6> for the FFI
+        let scalars_bigint: Vec<ark_ff::BigInt<6>> = scalars
+            .iter()
+            .map(|s| {
+                // SAFETY: BW6-761 scalar field is the same as BLS12-377 Fr
+                let s_ref: &ark_bw6_761::Fr = unsafe { &*(s as *const _ as *const ark_bw6_761::Fr) };
+                s_ref.into_bigint()
+            })
+            .collect();
+
+        // Try GPU MSM
+        match msm_bw6_761_gpu_cgbn(bases_bw6, &scalars_bigint) {
+            Ok(result) => {
+                // Convert back to generic type
+                // SAFETY: We verified E == BW6_761 above
+                unsafe { *(&result as *const _ as *const E::G1) }
+            }
+            Err(e) => {
+                eprintln!("[GPU MSM] CGBN kernel failed: {:?}, falling back to CPU", e);
+                E::G1::msm(bases, scalars).unwrap()
+            }
+        }
+    } else {
+        // Not BW6-761, use CPU
+        E::G1::msm(bases, scalars).unwrap()
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn msm_with_gpu_fallback<E: Pairing>(
+    bases: &[E::G1Affine],
+    scalars: &[E::ScalarField],
+) -> E::G1 {
+    E::G1::msm(bases, scalars).unwrap()
+}
 
 /// Build PVUGC VK and Lean PK from the OUTER proving key.
 ///
@@ -563,11 +623,11 @@ fn compute_witness_bases<C: RecursionCycle>(
                 }
             }
 
-            // Process MSMs
+            // Process MSMs (with GPU acceleration for BW6-761 when available)
             let msm_results: Vec<((u32, u32), <C::OuterE as Pairing>::G1)> = msm_tasks
                 .into_par_iter()
                 .map(|(bases, scalars, pair_id)| {
-                    let h_acc = <C::OuterE as Pairing>::G1::msm(&bases, &scalars).unwrap();
+                    let h_acc = msm_with_gpu_fallback::<C::OuterE>(&bases, &scalars);
                     (pair_id, h_acc)
                 })
                 .filter(|(_, h_acc)| !h_acc.is_zero())

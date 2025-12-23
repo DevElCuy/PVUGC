@@ -1,0 +1,75 @@
+# Makefile for standalone CGBN BW6-761 field test
+#
+# Usage:
+#   make -f cgbn_test_Makefile
+#   ./test_cgbn_bw6_field
+
+NVCC = nvcc
+CUDA_ARCH = sm_75
+CGBN_INCLUDE = ../../cgbn-lib/include
+
+TARGET_FIELD = test_cgbn_bw6_field
+SOURCE_FIELD = test_cgbn_bw6_field.cu
+
+TARGET_POINT = test_cgbn_point_add
+SOURCE_POINT = test_cgbn_point_add.cu
+
+NVCC_FLAGS = -arch=$(CUDA_ARCH) \
+             -I$(CGBN_INCLUDE) \
+             -lgmp \
+             --std=c++14 \
+             -Xcompiler -Wall
+
+# Verbose build (show ptxas stats)
+NVCC_FLAGS_VERBOSE = $(NVCC_FLAGS) --ptxas-options=-v
+
+.PHONY: all clean run verbose field point
+
+all: $(TARGET_FIELD) $(TARGET_POINT)
+
+field: $(TARGET_FIELD)
+
+point: $(TARGET_POINT)
+
+$(TARGET_FIELD): $(SOURCE_FIELD)
+	@echo "Building CGBN field test..."
+	@echo "  Architecture: $(CUDA_ARCH)"
+	@echo "  CGBN include: $(CGBN_INCLUDE)"
+	$(NVCC) $(NVCC_FLAGS) $(SOURCE_FIELD) -o $(TARGET_FIELD)
+	@echo "✅ Build complete: ./$(TARGET_FIELD)"
+
+$(TARGET_POINT): $(SOURCE_POINT)
+	@echo "Building CGBN point addition test..."
+	@echo "  Architecture: $(CUDA_ARCH)"
+	@echo "  CGBN include: $(CGBN_INCLUDE)"
+	$(NVCC) $(NVCC_FLAGS) $(SOURCE_POINT) -o $(TARGET_POINT)
+	@echo "✅ Build complete: ./$(TARGET_POINT)"
+
+verbose: $(SOURCE_FIELD) $(SOURCE_POINT)
+	@echo "Building field test with verbose ptxas output..."
+	$(NVCC) $(NVCC_FLAGS_VERBOSE) $(SOURCE_FIELD) -o $(TARGET_FIELD)
+	@echo "Building point test with verbose ptxas output..."
+	$(NVCC) $(NVCC_FLAGS_VERBOSE) $(SOURCE_POINT) -o $(TARGET_POINT)
+
+run: $(TARGET_FIELD) $(TARGET_POINT)
+	@echo "Running CGBN field test..."
+	./$(TARGET_FIELD)
+	@echo ""
+	@echo "Running CGBN point addition test..."
+	./$(TARGET_POINT)
+
+clean:
+	rm -f $(TARGET_FIELD) $(TARGET_POINT)
+
+# Help target
+help:
+	@echo "CGBN BW6-761 Field Test Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  make          - Build test (default)"
+	@echo "  make verbose  - Build with ptxas resource usage stats"
+	@echo "  make run      - Build and run test"
+	@echo "  make clean    - Remove built artifacts"
+	@echo ""
+	@echo "Environment variables:"
+	@echo "  CUDA_ARCH    - Target GPU architecture (default: sm_75)"

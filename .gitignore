@@ -46,3 +46,18 @@ coverage/
 
 # Local Cargo home (if used for isolated builds)
 /.cargo_home/
+
+# Performance cache for Groth16 proving/verification keys
+inner_crs_pk_vk.bin
+
+# CUDA debug and test files
+sppark-msm/src/test_field.cu
+sppark-msm/src/test_sizes_bw6.cu
+sppark-msm/tests/debug_bw6_761.rs
+src/bin/extract_bw6_params.rs
+
+# CUDA build artifacts
+*.o
+tmp_build/
+tmp_target/
+

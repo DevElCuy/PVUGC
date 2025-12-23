@@ -38,6 +38,13 @@ where
     let scalar_id = TypeId::of::<<G::ScalarField as PrimeField>::BigInt>();
 
     if g_id == TypeId::of::<Bls12_377_G1>() && scalar_id == TypeId::of::<BigInt<4>>() {
+        // SAFETY: TypeId check above ensures G is Bls12_377_G1 at this point.
+        // The real layout validation happens in the CUDA FFI layer:
+        // - Rust passes size_of::<G1Affine>() to the CUDA kernel
+        // - CUDA validates ffi_affine_sz == sizeof(sppark::affine_inf_t)
+        // - If mismatch (arkworks layout changed), CUDA returns error and we fall back to CPU
+        // This prevents silent data corruption from layout drift.
+
         let result =
             Bls12_377_G1::msm_gpu(unsafe { cast_slice(bases) }, unsafe { cast_slice(scalars) })
                 .ok()?;
