@@ -26,10 +26,38 @@ See `sppark-msm/docs/BW6_761_CGBN.md` for implementation details.
 ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test test_gpu_cgbn_bw6
 ```
 
+### ✅ Supported (Experimental): MNT4-298 G1
+
+**Curve**: MNT4-298 G1 (298-bit base field, curve parameter a=2)
+**Status**: Working via CGBN kernel (experimental)
+**Implementation**: Uses NVIDIA CGBN library with 320-bit field arithmetic (TPI=8)
+**Use Cases**: Inner proofs in the Mnt4Mnt6Cycle
+
+**Test Command**:
+```bash
+ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test test_gpu_cgbn_mnt4
+ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test layout_validation_mnt4_298
+```
+
+### ✅ Supported (Experimental): MNT6-298 G1
+
+**Curve**: MNT6-298 G1 (298-bit base field, curve parameter a=11)
+**Status**: Working via CGBN kernel (experimental)
+**Implementation**: Uses NVIDIA CGBN library with 320-bit field arithmetic (TPI=8)
+**Use Cases**: Outer proofs in the Mnt4Mnt6Cycle
+
+**Test Command**:
+```bash
+ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test test_gpu_cgbn_mnt6
+ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test layout_validation_mnt6_298
+```
+
 ### ❌ Not Supported
 
 - **BLS12-377 G2**: No GPU implementation
 - **BW6-761 G2**: No GPU implementation
+- **MNT4-298 G2**: No GPU implementation
+- **MNT6-298 G2**: No GPU implementation
 
 ## Important Limitations
 
@@ -143,11 +171,21 @@ Located in `tests/test_gpu_integration_bls12_377.rs`:
 
 **Run with**: `cargo test --features gpu --test test_gpu_integration_bls12_377`
 
+### CGBN Kernel Tests (Experimental Curves)
+
+**BW6-761 G1**: `cargo test --features gpu --test test_gpu_cgbn_bw6`
+**MNT4-298 G1**: `cargo test --features gpu --test test_gpu_cgbn_mnt4`
+**MNT6-298 G1**: `cargo test --features gpu --test test_gpu_cgbn_mnt6`
+
+Layout validation tests ensure correct FFI data layout:
+- `cargo test --features gpu --test layout_validation_bw6_761`
+- `cargo test --features gpu --test layout_validation_mnt4_298`
+- `cargo test --features gpu --test layout_validation_mnt6_298`
+
 ### What Tests DON'T Cover
 
-❌ **BW6-761 GPU acceleration** - Not implemented yet
-❌ **test_pvugc_on_outer_proof_e2e with GPU** - Outer proof uses BW6-761 (CPU only)
-❌ **BLS12-377 G2 operations** - No GPU implementation
+❌ **G2 operations** - No GPU implementation for any curve
+❌ **Pippenger algorithm** - Current CGBN kernels use serial double-and-add
 
 ## Architecture Details
 
@@ -158,15 +196,33 @@ User Code (Groth16 prover)
     ↓
 msm_backend::msm_g1<G>()  [src/msm_backend.rs]
     ↓
-TypeId check: Is G == BLS12-377 G1Affine?
-    ↓ Yes (with gpu feature)
-Layout safety assertions
+TypeId check: G type?
     ↓
-GpuMsm::msm_gpu()  [sppark-msm/src/lib.rs]
-    ↓
-CUDA kernel  [sppark-msm/src/msm_bls12_377.cu]
-    ↓
-sppark mont_t field arithmetic  [sppark-msm/sppark/ff/bls12-377.hpp]
+    ├─ BLS12-377 G1Affine
+    │    ↓
+    │  Layout safety assertions
+    │    ↓
+    │  GpuMsm::msm_gpu()  [sppark-msm/src/lib.rs]
+    │    ↓
+    │  CUDA kernel  [sppark-msm/src/msm_bls12_377.cu]
+    │    ↓
+    │  sppark mont_t field arithmetic
+    │
+    ├─ MNT4-298 G1Affine
+    │    ↓
+    │  GpuMsm::msm_gpu() → msm_mnt4_298_gpu_cgbn()
+    │    ↓
+    │  CGBN kernel [sppark-msm/src/msm_mnt4_298_cgbn.cu]
+    │    ↓
+    │  CGBN 320-bit field arithmetic (TPI=8, a=2)
+    │
+    └─ MNT6-298 G1Affine (via pvugc_outer.rs)
+         ↓
+       msm_mnt6_298_gpu_cgbn()
+         ↓
+       CGBN kernel [sppark-msm/src/msm_mnt6_298_cgbn.cu]
+         ↓
+       CGBN 320-bit field arithmetic (TPI=8, a=11)
 ```
 
 ### Safety Mechanisms
@@ -187,8 +243,8 @@ sppark mont_t field arithmetic  [sppark-msm/sppark/ff/bls12-377.hpp]
 ### When GPU Doesn't Help
 
 - Small MSMs (<64 points): CPU may be faster due to overhead
-- BW6-761 operations: Falls back to CPU
 - Systems without compatible CUDA GPU
+- G2 operations on any curve: No GPU implementation
 
 ## Troubleshooting
 
@@ -215,15 +271,22 @@ If you see "size mismatch" or "alignment mismatch" panics:
 
 ## Future Work
 
-### BW6-761 Optimizations
+### CGBN Kernel Optimizations (BW6-761, MNT4-298, MNT6-298)
 
-The current CGBN kernel uses serial double-and-add (O(n × log(scalar_bits))). Future improvements:
+The current CGBN kernels use serial double-and-add (O(n × log(scalar_bits))). Future improvements:
 
 1. **Pippenger Algorithm**: O(n / log(n)) for large MSMs
 2. **Parallel Scalar Multiplications**: Multiple thread groups + tree reduction
 3. **Remove ENABLE_CGBN_STUB Gate**: Once correctness validated in production
+4. **TPI Tuning**: Optimize thread-per-instance count for MNT curves (currently TPI=8)
 
-See `sppark-msm/docs/BW6_761_CGBN.md` for implementation details.
+**Key Differences in MNT Curves**:
+- MNT4-298/MNT6-298 use 320-bit fields (10 x u32 limbs) vs BW6-761's 768-bit fields (24 x u32 limbs)
+- MNT4 has curve parameter a=2, MNT6 has a=11 (vs BW6's a=0)
+- Point doubling formulas include a*ZZ^2 term for MNT curves
+
+See `sppark-msm/docs/BW6_761_CGBN.md` for CGBN implementation details.
+See `docs/MNT_CGBN_PLAN.md` and `docs/MNT_CGBN_SPEC.md` for MNT implementation details.
 
 ## References
 
@@ -231,5 +294,15 @@ See `sppark-msm/docs/BW6_761_CGBN.md` for implementation details.
 - **arkworks**: https://github.com/arkworks-rs
 - **CUDA Compute Capabilities**: https://developer.nvidia.com/cuda-gpus
 
+## Summary of Supported Curves
+
+| Curve | G1 GPU | Implementation | Status | Test Coverage |
+|-------|--------|---------------|--------|---------------|
+| BLS12-377 | ✅ | sppark Pippenger | Production | Comprehensive |
+| BW6-761 | ✅ | CGBN (serial) | Experimental | Basic |
+| MNT4-298 | ✅ | CGBN (serial) | Experimental | Basic |
+| MNT6-298 | ✅ | CGBN (serial) | Experimental | Basic |
+| *-* G2 | ❌ | N/A | Not implemented | N/A |
+
 ---
-*Last Updated: 2025-12-23*
+*Last Updated: 2025-12-24*

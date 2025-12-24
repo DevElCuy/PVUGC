@@ -106,6 +106,69 @@ const _: () = {
         "BigInt<6> alignment mismatch - should align to u64");
 };
 
+/// Compile-time layout validation for MNT4-298 G1Affine
+#[cfg(feature = "gpu")]
+const _: () = {
+    use ark_mnt4_298::{G1Affine, Fq};
+
+    // G1Affine should be exactly 2 Fq fields + infinity flag
+    // MNT4-298 Fq is 298 bits (40 bytes)
+    const FQ_SIZE: usize = size_of::<Fq>();
+    const EXPECTED_MIN_SIZE: usize = 2 * FQ_SIZE + 1;
+    const ACTUAL_SIZE: usize = size_of::<G1Affine>();
+
+    assert!(ACTUAL_SIZE >= EXPECTED_MIN_SIZE,
+        "MNT4-298 G1Affine size smaller than expected - layout changed");
+
+    const MAX_REASONABLE_SIZE: usize = 2 * FQ_SIZE + 32;
+    assert!(ACTUAL_SIZE <= MAX_REASONABLE_SIZE,
+        "MNT4-298 G1Affine size unexpectedly large - layout may have changed");
+
+    const ACTUAL_ALIGN: usize = align_of::<G1Affine>();
+    assert!(ACTUAL_ALIGN <= 64, "MNT4-298 G1Affine alignment unexpectedly large");
+};
+
+/// Compile-time layout validation for MNT6-298 G1Affine
+#[cfg(feature = "gpu")]
+const _: () = {
+    use ark_mnt6_298::{G1Affine, Fq};
+
+    // G1Affine should be exactly 2 Fq fields + infinity flag
+    // MNT6-298 Fq is 298 bits (40 bytes)
+    const FQ_SIZE: usize = size_of::<Fq>();
+    const EXPECTED_MIN_SIZE: usize = 2 * FQ_SIZE + 1;
+    const ACTUAL_SIZE: usize = size_of::<G1Affine>();
+
+    assert!(ACTUAL_SIZE >= EXPECTED_MIN_SIZE,
+        "MNT6-298 G1Affine size smaller than expected - layout changed");
+
+    const MAX_REASONABLE_SIZE: usize = 2 * FQ_SIZE + 32;
+    assert!(ACTUAL_SIZE <= MAX_REASONABLE_SIZE,
+        "MNT6-298 G1Affine size unexpectedly large - layout may have changed");
+
+    const ACTUAL_ALIGN: usize = align_of::<G1Affine>();
+    assert!(ACTUAL_ALIGN <= 64, "MNT6-298 G1Affine alignment unexpectedly large");
+};
+
+/// Compile-time layout validation for BigInt<5>
+/// MNT4-298 and MNT6-298 fields are 298 bits (5 u64 limbs)
+#[cfg(feature = "gpu")]
+const _: () = {
+    use ark_ff::BigInt;
+
+    // BigInt<5> should be exactly 5 u64 limbs
+    const EXPECTED_SIZE: usize = 5 * size_of::<u64>();
+    const ACTUAL_SIZE: usize = size_of::<BigInt<5>>();
+
+    assert!(ACTUAL_SIZE == EXPECTED_SIZE,
+        "BigInt<5> size mismatch - should be 5 * u64");
+
+    // Alignment should be u64
+    const ACTUAL_ALIGN: usize = align_of::<BigInt<5>>();
+    assert!(ACTUAL_ALIGN == align_of::<u64>(),
+        "BigInt<5> alignment mismatch - should align to u64");
+};
+
 #[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
 #[allow(improper_ctypes)]
 extern "C" {
@@ -124,6 +187,26 @@ extern "C" {
         scalars: *const BigInt<6>,
         count: usize,
         result: *mut ark_bw6_761::G1Projective,
+        ffi_affine_sz: usize,
+        ffi_scalar_sz: usize,
+    ) -> i32;
+
+    #[cfg(mnt4_cgbn_available)]
+    fn msm_mnt4_298_g1_cgbn(
+        points: *const ark_mnt4_298::G1Affine,
+        scalars: *const BigInt<5>,
+        count: usize,
+        result: *mut ark_mnt4_298::G1Projective,
+        ffi_affine_sz: usize,
+        ffi_scalar_sz: usize,
+    ) -> i32;
+
+    #[cfg(mnt6_cgbn_available)]
+    fn msm_mnt6_298_g1_cgbn(
+        points: *const ark_mnt6_298::G1Affine,
+        scalars: *const BigInt<5>,
+        count: usize,
+        result: *mut ark_mnt6_298::G1Projective,
         ffi_affine_sz: usize,
         ffi_scalar_sz: usize,
     ) -> i32;
@@ -360,4 +443,274 @@ pub fn msm_bw6_761_gpu_cgbn(
     _scalars: &[BigInt<6>],
 ) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
     Err(Bw6GpuError::KernelUnavailable)
+}
+
+// ========== MNT4-298 GPU MSM Implementation ==========
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MntGpuError {
+    AffineLayoutMismatch,
+    ScalarLayoutMismatch,
+    CudaRuntime,
+    Timeout,
+    KernelUnavailable,
+    Unknown(i32),
+}
+
+impl MntGpuError {
+    fn from_status(code: i32) -> Self {
+        match code {
+            0 => unreachable!(),
+            -1 => MntGpuError::AffineLayoutMismatch,
+            -2 => MntGpuError::ScalarLayoutMismatch,
+            -3 => MntGpuError::CudaRuntime,
+            -4 => MntGpuError::Timeout,
+            -5 => MntGpuError::KernelUnavailable,
+            other => MntGpuError::Unknown(other),
+        }
+    }
+}
+
+// Note: GpuMsm trait is NOT implemented for MNT4-298 because MNT4 and MNT6
+// share the same underlying G1Affine type (they form a cycle pair), causing
+// Rust trait coherence conflicts. Use msm_mnt4_298_gpu_cgbn() directly instead.
+
+// CGBN-based MNT4-298 MSM kernel
+#[cfg(all(feature = "gpu", mnt4_cgbn_available))]
+pub fn msm_mnt4_298_gpu_cgbn(
+    points: &[ark_mnt4_298::G1Affine],
+    scalars: &[BigInt<5>],
+) -> Result<ark_mnt4_298::G1Projective, MntGpuError> {
+    use ark_ff::PrimeField;
+    use ark_mnt4_298::Fq;
+
+    if points.len() != scalars.len() {
+        return Err(MntGpuError::Unknown(-99));
+    }
+
+    // CUDA expects uint32_t[10], but arkworks BigInt<5> is u64[5]
+    // Convert from u64[5] to u32[10]
+    #[repr(C)]
+    struct PlainG1Affine {
+        x: [u32; 10],
+        y: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    #[repr(C)]
+    struct PlainG1Projective {
+        x: [u32; 10],
+        y: [u32; 10],
+        z: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    // Helper: convert BigInt<5> (u64[5]) to [u32; 10]
+    fn bigint_to_u32_array(bigint: ark_ff::BigInt<5>) -> [u32; 10] {
+        let mut result = [0u32; 10];
+        for (i, &limb_u64) in bigint.0.iter().enumerate() {
+            result[i * 2] = limb_u64 as u32;
+            result[i * 2 + 1] = (limb_u64 >> 32) as u32;
+        }
+        result
+    }
+
+    // Helper: convert [u32; 10] back to BigInt<5>
+    fn u32_array_to_bigint(arr: &[u32; 10]) -> ark_ff::BigInt<5> {
+        let mut limbs = [0u64; 5];
+        for i in 0..5 {
+            limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+        }
+        ark_ff::BigInt(limbs)
+    }
+
+    let plain_points: Vec<PlainG1Affine> = points.iter().map(|p| {
+        if p.infinity {
+            PlainG1Affine {
+                x: [0u32; 10],
+                y: [0u32; 10],
+                infinity: true,
+                _padding: [0u8; 7],
+            }
+        } else {
+            let x_bigint = p.x.into_bigint();
+            let y_bigint = p.y.into_bigint();
+            PlainG1Affine {
+                x: bigint_to_u32_array(x_bigint),
+                y: bigint_to_u32_array(y_bigint),
+                infinity: false,
+                _padding: [0u8; 7],
+            }
+        }
+    }).collect();
+
+    let mut plain_result = PlainG1Projective {
+        x: [0u32; 10],
+        y: [0u32; 10],
+        z: [0u32; 10],
+        infinity: false,
+        _padding: [0u8; 7],
+    };
+
+    let status = unsafe {
+        msm_mnt4_298_g1_cgbn(
+            plain_points.as_ptr() as *const ark_mnt4_298::G1Affine,
+            scalars.as_ptr(),
+            points.len(),
+            &mut plain_result as *mut PlainG1Projective as *mut ark_mnt4_298::G1Projective,
+            core::mem::size_of::<PlainG1Affine>(),
+            core::mem::size_of::<BigInt<5>>(),
+        )
+    };
+
+    if status != 0 {
+        return Err(MntGpuError::from_status(status));
+    }
+
+    if plain_result.infinity {
+        return Ok(ark_mnt4_298::G1Projective::default());
+    }
+
+    let x_bigint = u32_array_to_bigint(&plain_result.x);
+    let y_bigint = u32_array_to_bigint(&plain_result.y);
+    let z_bigint = u32_array_to_bigint(&plain_result.z);
+
+    let x_fq = Fq::from_bigint(x_bigint).ok_or(MntGpuError::Unknown(-100))?;
+    let y_fq = Fq::from_bigint(y_bigint).ok_or(MntGpuError::Unknown(-101))?;
+    let z_fq = Fq::from_bigint(z_bigint).ok_or(MntGpuError::Unknown(-102))?;
+
+    Ok(ark_mnt4_298::G1Projective::new_unchecked(x_fq, y_fq, z_fq))
+}
+
+#[cfg(not(all(feature = "gpu", mnt4_cgbn_available)))]
+pub fn msm_mnt4_298_gpu_cgbn(
+    _points: &[ark_mnt4_298::G1Affine],
+    _scalars: &[BigInt<5>],
+) -> Result<ark_mnt4_298::G1Projective, MntGpuError> {
+    Err(MntGpuError::KernelUnavailable)
+}
+
+// ========== MNT6-298 GPU MSM Implementation ==========
+
+// Note: GpuMsm trait is NOT implemented for MNT6-298 because MNT4 and MNT6
+// share the same underlying G1Affine type (they form a cycle pair), causing
+// Rust trait coherence conflicts. Use msm_mnt6_298_gpu_cgbn() directly instead.
+
+// CGBN-based MNT6-298 MSM kernel
+#[cfg(all(feature = "gpu", mnt6_cgbn_available))]
+pub fn msm_mnt6_298_gpu_cgbn(
+    points: &[ark_mnt6_298::G1Affine],
+    scalars: &[BigInt<5>],
+) -> Result<ark_mnt6_298::G1Projective, MntGpuError> {
+    use ark_ff::PrimeField;
+    use ark_mnt6_298::Fq;
+
+    if points.len() != scalars.len() {
+        return Err(MntGpuError::Unknown(-99));
+    }
+
+    // CUDA expects uint32_t[10], but arkworks BigInt<5> is u64[5]
+    #[repr(C)]
+    struct PlainG1Affine {
+        x: [u32; 10],
+        y: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    #[repr(C)]
+    struct PlainG1Projective {
+        x: [u32; 10],
+        y: [u32; 10],
+        z: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    // Helper: convert BigInt<5> (u64[5]) to [u32; 10]
+    fn bigint_to_u32_array(bigint: ark_ff::BigInt<5>) -> [u32; 10] {
+        let mut result = [0u32; 10];
+        for (i, &limb_u64) in bigint.0.iter().enumerate() {
+            result[i * 2] = limb_u64 as u32;
+            result[i * 2 + 1] = (limb_u64 >> 32) as u32;
+        }
+        result
+    }
+
+    // Helper: convert [u32; 10] back to BigInt<5>
+    fn u32_array_to_bigint(arr: &[u32; 10]) -> ark_ff::BigInt<5> {
+        let mut limbs = [0u64; 5];
+        for i in 0..5 {
+            limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+        }
+        ark_ff::BigInt(limbs)
+    }
+
+    let plain_points: Vec<PlainG1Affine> = points.iter().map(|p| {
+        if p.infinity {
+            PlainG1Affine {
+                x: [0u32; 10],
+                y: [0u32; 10],
+                infinity: true,
+                _padding: [0u8; 7],
+            }
+        } else {
+            let x_bigint = p.x.into_bigint();
+            let y_bigint = p.y.into_bigint();
+            PlainG1Affine {
+                x: bigint_to_u32_array(x_bigint),
+                y: bigint_to_u32_array(y_bigint),
+                infinity: false,
+                _padding: [0u8; 7],
+            }
+        }
+    }).collect();
+
+    let mut plain_result = PlainG1Projective {
+        x: [0u32; 10],
+        y: [0u32; 10],
+        z: [0u32; 10],
+        infinity: false,
+        _padding: [0u8; 7],
+    };
+
+    let status = unsafe {
+        msm_mnt6_298_g1_cgbn(
+            plain_points.as_ptr() as *const ark_mnt6_298::G1Affine,
+            scalars.as_ptr(),
+            points.len(),
+            &mut plain_result as *mut PlainG1Projective as *mut ark_mnt6_298::G1Projective,
+            core::mem::size_of::<PlainG1Affine>(),
+            core::mem::size_of::<BigInt<5>>(),
+        )
+    };
+
+    if status != 0 {
+        return Err(MntGpuError::from_status(status));
+    }
+
+    if plain_result.infinity {
+        return Ok(ark_mnt6_298::G1Projective::default());
+    }
+
+    let x_bigint = u32_array_to_bigint(&plain_result.x);
+    let y_bigint = u32_array_to_bigint(&plain_result.y);
+    let z_bigint = u32_array_to_bigint(&plain_result.z);
+
+    let x_fq = Fq::from_bigint(x_bigint).ok_or(MntGpuError::Unknown(-100))?;
+    let y_fq = Fq::from_bigint(y_bigint).ok_or(MntGpuError::Unknown(-101))?;
+    let z_fq = Fq::from_bigint(z_bigint).ok_or(MntGpuError::Unknown(-102))?;
+
+    Ok(ark_mnt6_298::G1Projective::new_unchecked(x_fq, y_fq, z_fq))
+}
+
+#[cfg(not(all(feature = "gpu", mnt6_cgbn_available)))]
+pub fn msm_mnt6_298_gpu_cgbn(
+    _points: &[ark_mnt6_298::G1Affine],
+    _scalars: &[BigInt<5>],
+) -> Result<ark_mnt6_298::G1Projective, MntGpuError> {
+    Err(MntGpuError::KernelUnavailable)
 }

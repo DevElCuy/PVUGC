@@ -19,6 +19,7 @@ where
     <G::ScalarField as PrimeField>::BigInt: 'static,
 {
     use ark_bls12_377::G1Affine as Bls12_377_G1;
+    use ark_mnt4_298::G1Affine as Mnt4_298_G1;
     use ark_ff::BigInt;
     use std::mem;
 
@@ -48,6 +49,16 @@ where
         let result =
             Bls12_377_G1::msm_gpu(unsafe { cast_slice(bases) }, unsafe { cast_slice(scalars) })
                 .ok()?;
+        return Some(unsafe { cast_group(result) });
+    }
+
+    // MNT4-298 GPU dispatch (CGBN kernel)
+    // Note: We call the function directly instead of using GpuMsm trait because
+    // MNT4 and MNT6 share the same underlying G1Affine type (cycle pair).
+    if g_id == TypeId::of::<Mnt4_298_G1>() && scalar_id == TypeId::of::<BigInt<5>>() {
+        let bases_mnt4: &[Mnt4_298_G1] = unsafe { cast_slice(bases) };
+        let scalars_mnt4: &[BigInt<5>] = unsafe { cast_slice(scalars) };
+        let result = sppark_msm::msm_mnt4_298_gpu_cgbn(bases_mnt4, scalars_mnt4).ok()?;
         return Some(unsafe { cast_group(result) });
     }
 

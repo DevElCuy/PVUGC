@@ -11,6 +11,8 @@ bw6_generic = []  # Enable broken generic BW6-761 kernel (hangs due to register 
 [dependencies]
 ark-bls12-377 = "0.5"
 ark-bw6-761 = "0.5"
+ark-mnt4-298 = "0.5"
+ark-mnt6-298 = "0.5"
 ark-ec = "0.5"
 ark-ff = "0.5"
 ark-std = "0.5"
@@ -34,4 +36,26 @@ harness = false
 [[test]]
 name = "test_gpu_cpu_consistency"
 path = "tests/test_gpu_cpu_consistency.rs"
+harness = false
+
+# MNT4-298 CGBN GPU tests
+[[test]]
+name = "test_gpu_cgbn_mnt4"
+path = "tests/test_gpu_cgbn_mnt4.rs"
+harness = false
+
+[[test]]
+name = "layout_validation_mnt4_298"
+path = "tests/layout_validation_mnt4_298.rs"
+harness = false
+
+# MNT6-298 CGBN GPU tests
+[[test]]
+name = "test_gpu_cgbn_mnt6"
+path = "tests/test_gpu_cgbn_mnt6.rs"
+harness = false
+
+[[test]]
+name = "layout_validation_mnt6_298"
+path = "tests/layout_validation_mnt6_298.rs"
 harness = false

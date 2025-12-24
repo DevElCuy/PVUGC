@@ -27,7 +27,7 @@ use std::time::Instant;
 
 // GPU MSM support via CGBN kernel
 #[cfg(feature = "gpu")]
-use sppark_msm::msm_bw6_761_gpu_cgbn;
+use sppark_msm::{msm_bw6_761_gpu_cgbn, msm_mnt6_298_gpu_cgbn};
 
 type StatementVec<C> = Vec<InnerScalar<C>>;
 
@@ -73,8 +73,43 @@ fn msm_with_gpu_fallback<E: Pairing>(
                 E::G1::msm(bases, scalars).unwrap()
             }
         }
-    } else {
-        // Not BW6-761, use CPU
+    }
+    // Check if this is MNT6-298 (the outer curve for MNT4-298/MNT6-298 cycle)
+    else if TypeId::of::<E>() == TypeId::of::<ark_mnt6_298::MNT6_298>() {
+        // Convert to concrete types for GPU kernel
+        // SAFETY: We verified the type above
+        let bases_mnt6: &[ark_mnt6_298::G1Affine] = unsafe {
+            std::slice::from_raw_parts(
+                bases.as_ptr() as *const ark_mnt6_298::G1Affine,
+                bases.len(),
+            )
+        };
+
+        // Convert scalars to BigInt<5> for the FFI
+        let scalars_bigint: Vec<ark_ff::BigInt<5>> = scalars
+            .iter()
+            .map(|s| {
+                // SAFETY: MNT6-298 scalar field is the same as MNT4-298 Fr
+                let s_ref: &ark_mnt6_298::Fr = unsafe { &*(s as *const _ as *const ark_mnt6_298::Fr) };
+                s_ref.into_bigint()
+            })
+            .collect();
+
+        // Try GPU MSM
+        match msm_mnt6_298_gpu_cgbn(bases_mnt6, &scalars_bigint) {
+            Ok(result) => {
+                // Convert back to generic type
+                // SAFETY: We verified E == MNT6_298 above
+                unsafe { *(&result as *const _ as *const E::G1) }
+            }
+            Err(e) => {
+                eprintln!("[GPU MSM] MNT6-298 CGBN kernel failed: {:?}, falling back to CPU", e);
+                E::G1::msm(bases, scalars).unwrap()
+            }
+        }
+    }
+    else {
+        // Not BW6-761 or MNT6-298, use CPU
         E::G1::msm(bases, scalars).unwrap()
     }
 }
