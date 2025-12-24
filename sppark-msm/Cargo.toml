@@ -59,3 +59,21 @@ harness = false
 name = "layout_validation_mnt6_298"
 path = "tests/layout_validation_mnt6_298.rs"
 harness = false
+
+# MNT4-298 CPU vs GPU consistency tests - critical for production validation
+[[test]]
+name = "test_mnt4_cpu_gpu_consistency"
+path = "tests/test_mnt4_cpu_gpu_consistency.rs"
+harness = false
+
+# MNT6-298 CPU vs GPU consistency tests - critical for production validation
+[[test]]
+name = "test_mnt6_cpu_gpu_consistency"
+path = "tests/test_mnt6_cpu_gpu_consistency.rs"
+harness = false
+
+# Sparse quotient GPU kernel tests - validates coefficient computation
+[[test]]
+name = "test_sparse_quotient_gpu"
+path = "tests/test_sparse_quotient_gpu.rs"
+harness = false
