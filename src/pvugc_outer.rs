@@ -29,6 +29,13 @@ use std::time::Instant;
 #[cfg(feature = "gpu")]
 use sppark_msm::{msm_bw6_761_gpu_cgbn, msm_mnt6_298_gpu_cgbn};
 
+// GPU sparse quotient coefficient computation
+#[cfg(feature = "gpu")]
+use sppark_msm::{
+    compute_sparse_quotient_coeffs_mnt4_298_gpu, sparse_quotient_gpu_available,
+    SparseMatrixCsr, SparseQuotientPairOutput,
+};
+
 type StatementVec<C> = Vec<InnerScalar<C>>;
 
 /// Perform MSM with GPU acceleration when available for BW6-761.
@@ -120,6 +127,76 @@ fn msm_with_gpu_fallback<E: Pairing>(
     scalars: &[E::ScalarField],
 ) -> E::G1 {
     E::G1::msm(bases, scalars).unwrap()
+}
+
+/// Convert sparse columns to CSR format for GPU sparse quotient computation.
+///
+/// The input is a Vec of columns, where each column is a Vec of (row_idx, scalar_value) pairs.
+/// The output is a SparseMatrixCsr with col_ptr, row_idx, and values arrays.
+#[cfg(feature = "gpu")]
+fn sparse_columns_to_csr<F: PrimeField>(
+    cols: &[Vec<(usize, F)>],
+) -> SparseMatrixCsr {
+    let num_cols = cols.len();
+    let mut col_ptr = Vec::with_capacity(num_cols + 1);
+    let mut row_idx = Vec::new();
+    let mut values = Vec::new();
+
+    col_ptr.push(0u32);
+    for col in cols {
+        for &(row, val) in col {
+            row_idx.push(row as u32);
+            // Convert scalar to [u32; 10] in plain form (Montgomery reduction)
+            let bigint = val.into_bigint();
+            let mut limbs = [0u32; 10];
+            // F::BigInt is typically BigInt<N> with u64 limbs
+            // For MNT4/MNT6-298, N=5 (5 u64 limbs = 10 u32 limbs)
+            let u64_limbs = bigint.as_ref();
+            for (i, &limb_u64) in u64_limbs.iter().enumerate().take(5) {
+                limbs[i * 2] = limb_u64 as u32;
+                limbs[i * 2 + 1] = (limb_u64 >> 32) as u32;
+            }
+            values.push(limbs);
+        }
+        col_ptr.push(values.len() as u32);
+    }
+
+    SparseMatrixCsr {
+        col_ptr,
+        row_idx,
+        values,
+    }
+}
+
+/// Convert a Vec of scalars to [u32; 10] arrays in plain form for GPU.
+#[cfg(feature = "gpu")]
+fn scalars_to_u32_array<F: PrimeField>(scalars: &[F]) -> Vec<[u32; 10]> {
+    scalars
+        .iter()
+        .map(|s| {
+            let bigint = s.into_bigint();
+            let mut limbs = [0u32; 10];
+            let u64_limbs = bigint.as_ref();
+            for (i, &limb_u64) in u64_limbs.iter().enumerate().take(5) {
+                limbs[i * 2] = limb_u64 as u32;
+                limbs[i * 2 + 1] = (limb_u64 >> 32) as u32;
+            }
+            limbs
+        })
+        .collect()
+}
+
+/// Convert [u32; 10] array back to scalar field element.
+#[cfg(feature = "gpu")]
+fn u32_array_to_scalar<F: PrimeField>(arr: &[u32; 10]) -> F {
+    // Reconstruct u64 limbs from u32 pairs
+    let mut u64_limbs = [0u64; 5];
+    for i in 0..5 {
+        u64_limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+    }
+    // Create BigInt from limbs and convert to field element
+    // Note: from_bigint expects plain form and converts to Montgomery
+    F::from_bigint(ark_ff::BigInt(u64_limbs)).expect("valid field element")
 }
 
 /// Build PVUGC VK and Lean PK from the OUTER proving key.

@@ -1,8 +1,13 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+
 fn main() {
     println!("cargo:rerun-if-changed=src/msm_bls12_377.cu");
     println!("cargo:rerun-if-changed=src/msm_bw6_761_cgbn.cu");
     println!("cargo:rerun-if-changed=src/msm_mnt4_298_cgbn.cu");
     println!("cargo:rerun-if-changed=src/msm_mnt6_298_cgbn.cu");
+    println!("cargo:rerun-if-changed=src/sparse_quotient_mnt4_298_cgbn.cu");
+    println!("cargo:rerun-if-changed=src/sparse_quotient_mnt6_298_cgbn.cu");
     println!("cargo:rerun-if-changed=sppark");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
@@ -11,6 +16,8 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(bw6_cgbn_available)");
     println!("cargo::rustc-check-cfg=cfg(mnt4_cgbn_available)");
     println!("cargo::rustc-check-cfg=cfg(mnt6_cgbn_available)");
+    println!("cargo::rustc-check-cfg=cfg(sparse_quotient_mnt4_available)");
+    println!("cargo::rustc-check-cfg=cfg(sparse_quotient_mnt6_available)");
 
     if std::env::var("CARGO_FEATURE_GPU").is_err() {
         println!("cargo:warning=CUDA build skipped (feature \"gpu\" not enabled)");
@@ -22,29 +29,236 @@ fn main() {
     let cuda_lib = format!("{}/lib64", cuda_home);
 
     // Allow GPU architecture to be configured via environment variable
-    // Default: sm_75 (Turing - GTX 1660, RTX 2060, etc.)
-    // Common values: sm_60 (Pascal), sm_70 (Volta), sm_75 (Turing), sm_80 (Ampere), sm_89 (Ada), sm_90 (Hopper)
     let cuda_arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_75".to_string());
     let arch_flag = format!("-arch={}", cuda_arch);
 
-    // Build CUDA kernels
+    let cuda_verbose = std::env::var("CUDA_VERBOSE").is_ok();
+    let bw6_debug = std::env::var("BW6_DEBUG").is_ok();
+    let cgbn_include = "../cgbn-lib/include";
+
+    // Atomic flags for tracking which kernels succeeded
+    let bw6_available = AtomicBool::new(false);
+    let mnt4_available = AtomicBool::new(false);
+    let mnt6_available = AtomicBool::new(false);
+    let sparse_mnt4_available = AtomicBool::new(false);
+    let sparse_mnt6_available = AtomicBool::new(false);
+
+    // Use thread::scope for parallel compilation of CGBN kernels
+    println!("cargo:warning=Starting parallel CUDA kernel compilation...");
+
+    thread::scope(|s| {
+        // BW6-761 CGBN kernel
+        let bw6_handle = s.spawn(|| {
+            let mut build = cc::Build::new();
+            build
+                .cuda(true)
+                .flag("-std=c++17")
+                .flag("-allow-unsupported-compiler")
+                .flag(&arch_flag)
+                .flag("-rdc=true")
+                .flag("-Xcompiler").flag("-O3")
+                .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+                .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
+                .flag("--maxrregcount=128");
+
+            if cuda_verbose {
+                build.flag("--ptxas-options=-v");
+            }
+            if bw6_debug {
+                build.define("BW6_DEBUG", None);
+            }
+
+            build
+                .include("sppark")
+                .include("sppark/blst/src")
+                .include(&cuda_include)
+                .include(cgbn_include)
+                .include("/usr/include")
+                .include("/usr/include/x86_64-linux-gnu")
+                .file("src/msm_bw6_761_cgbn.cu");
+
+            build.try_compile("msm_bw6_cgbn").is_ok()
+        });
+
+        // MNT4-298 CGBN kernel
+        let mnt4_handle = s.spawn(|| {
+            let mut build = cc::Build::new();
+            build
+                .cuda(true)
+                .flag("-std=c++17")
+                .flag("-allow-unsupported-compiler")
+                .flag(&arch_flag)
+                .flag("-rdc=true")
+                .flag("-Xcompiler").flag("-O3")
+                .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+                .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
+                .flag("--maxrregcount=128");
+
+            if cuda_verbose {
+                build.flag("--ptxas-options=-v");
+            }
+
+            build
+                .include("sppark")
+                .include("sppark/blst/src")
+                .include(&cuda_include)
+                .include(cgbn_include)
+                .include("/usr/include")
+                .include("/usr/include/x86_64-linux-gnu")
+                .file("src/msm_mnt4_298_cgbn.cu");
+
+            build.try_compile("msm_mnt4_cgbn").is_ok()
+        });
+
+        // MNT6-298 CGBN kernel
+        let mnt6_handle = s.spawn(|| {
+            let mut build = cc::Build::new();
+            build
+                .cuda(true)
+                .flag("-std=c++17")
+                .flag("-allow-unsupported-compiler")
+                .flag(&arch_flag)
+                .flag("-rdc=true")
+                .flag("-Xcompiler").flag("-O3")
+                .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+                .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
+                .flag("--maxrregcount=128");
+
+            if cuda_verbose {
+                build.flag("--ptxas-options=-v");
+            }
+
+            build
+                .include("sppark")
+                .include("sppark/blst/src")
+                .include(&cuda_include)
+                .include(cgbn_include)
+                .include("/usr/include")
+                .include("/usr/include/x86_64-linux-gnu")
+                .file("src/msm_mnt6_298_cgbn.cu");
+
+            build.try_compile("msm_mnt6_cgbn").is_ok()
+        });
+
+        // Sparse quotient MNT4-298 kernel
+        let sparse_mnt4_handle = s.spawn(|| {
+            let mut build = cc::Build::new();
+            build
+                .cuda(true)
+                .flag("-std=c++17")
+                .flag("-allow-unsupported-compiler")
+                .flag(&arch_flag)
+                .flag("-rdc=true")
+                .flag("-Xcompiler").flag("-O3")
+                .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+                .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
+                .flag("--maxrregcount=128");
+
+            if cuda_verbose {
+                build.flag("--ptxas-options=-v");
+            }
+
+            build
+                .include("sppark")
+                .include("sppark/blst/src")
+                .include(&cuda_include)
+                .include(cgbn_include)
+                .include("/usr/include")
+                .include("/usr/include/x86_64-linux-gnu")
+                .file("src/sparse_quotient_mnt4_298_cgbn.cu");
+
+            build.try_compile("sparse_quotient_mnt4_cgbn").is_ok()
+        });
+
+        // Sparse quotient MNT6-298 kernel
+        let sparse_mnt6_handle = s.spawn(|| {
+            let mut build = cc::Build::new();
+            build
+                .cuda(true)
+                .flag("-std=c++17")
+                .flag("-allow-unsupported-compiler")
+                .flag(&arch_flag)
+                .flag("-rdc=true")
+                .flag("-Xcompiler").flag("-O3")
+                .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+                .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
+                .flag("--maxrregcount=128");
+
+            if cuda_verbose {
+                build.flag("--ptxas-options=-v");
+            }
+
+            build
+                .include("sppark")
+                .include("sppark/blst/src")
+                .include(&cuda_include)
+                .include(cgbn_include)
+                .include("/usr/include")
+                .include("/usr/include/x86_64-linux-gnu")
+                .file("src/sparse_quotient_mnt6_298_cgbn.cu");
+
+            build.try_compile("sparse_quotient_mnt6_cgbn").is_ok()
+        });
+
+        // Wait for all threads and store results
+        bw6_available.store(bw6_handle.join().unwrap_or(false), Ordering::SeqCst);
+        mnt4_available.store(mnt4_handle.join().unwrap_or(false), Ordering::SeqCst);
+        mnt6_available.store(mnt6_handle.join().unwrap_or(false), Ordering::SeqCst);
+        sparse_mnt4_available.store(sparse_mnt4_handle.join().unwrap_or(false), Ordering::SeqCst);
+        sparse_mnt6_available.store(sparse_mnt6_handle.join().unwrap_or(false), Ordering::SeqCst);
+    });
+
+    // Report CGBN kernel availability
+    if bw6_available.load(Ordering::SeqCst) {
+        println!("cargo:rustc-link-lib=gmp");
+        println!("cargo:rustc-cfg=bw6_cgbn_available");
+        println!("cargo:warning=BW6-761 CGBN: AVAILABLE (TPI=8, BITS=768)");
+    } else {
+        println!("cargo:warning=BW6-761 CGBN: NOT AVAILABLE");
+    }
+
+    if mnt4_available.load(Ordering::SeqCst) {
+        println!("cargo:rustc-cfg=mnt4_cgbn_available");
+        println!("cargo:warning=MNT4-298 CGBN: AVAILABLE (TPI=8, BITS=320)");
+    } else {
+        println!("cargo:warning=MNT4-298 CGBN: NOT AVAILABLE");
+    }
+
+    if mnt6_available.load(Ordering::SeqCst) {
+        println!("cargo:rustc-cfg=mnt6_cgbn_available");
+        println!("cargo:warning=MNT6-298 CGBN: AVAILABLE (TPI=8, BITS=320)");
+    } else {
+        println!("cargo:warning=MNT6-298 CGBN: NOT AVAILABLE");
+    }
+
+    if sparse_mnt4_available.load(Ordering::SeqCst) {
+        println!("cargo:rustc-cfg=sparse_quotient_mnt4_available");
+        println!("cargo:warning=Sparse Quotient MNT4-298: AVAILABLE");
+    } else {
+        println!("cargo:warning=Sparse Quotient MNT4-298: NOT AVAILABLE");
+    }
+
+    if sparse_mnt6_available.load(Ordering::SeqCst) {
+        println!("cargo:rustc-cfg=sparse_quotient_mnt6_available");
+        println!("cargo:warning=Sparse Quotient MNT6-298: AVAILABLE");
+    } else {
+        println!("cargo:warning=Sparse Quotient MNT6-298: NOT AVAILABLE");
+    }
+
+    // Build BLS12-377 kernel (required for base functionality)
     let mut cuda_build = cc::Build::new();
     cuda_build
         .cuda(true)
         .flag("-std=c++17")
         .flag("-allow-unsupported-compiler")
         .flag(&arch_flag)
-        .flag("-rdc=true")  // Enable relocatable device code for multiple .cu files
-        .flag("-Xcompiler")
-        .flag("-O3")
-        .flag("-Xcompiler")
-        .flag("-Wno-unknown-pragmas")  // Suppress #pragma unroll warnings
-        .flag("-Xcompiler")
-        .flag("-Wno-maybe-uninitialized")  // Suppress false-positive flow analysis warnings
+        .flag("-rdc=true")
+        .flag("-Xcompiler").flag("-O3")
+        .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+        .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
         .flag("--maxrregcount=128");
 
-    // Only enable verbose ptxas output if CUDA_VERBOSE=1
-    if std::env::var("CUDA_VERBOSE").is_ok() {
+    if cuda_verbose {
         cuda_build.flag("--ptxas-options=-v");
     }
 
@@ -54,145 +268,13 @@ fn main() {
         .include(&cuda_include)
         .file("src/msm_bls12_377.cu");
 
-    // Build CGBN-based BW6-761 kernel
-    // Note: The sppark-based specialized kernel was removed because BW6-761's 761-bit
-    // base field generates stack frames too large for GPU execution (~22KB/thread).
-    // See docs/BW6_761_CGBN.md for historical context.
-    let cgbn_include = "../cgbn-lib/include";
-    let mut cgbn_build = cc::Build::new();
-
-    cgbn_build
-        .cuda(true)
-        .flag("-std=c++17")
-        .flag("-allow-unsupported-compiler")
-        .flag(&arch_flag)
-        .flag("-rdc=true")
-        .flag("-Xcompiler")
-        .flag("-O3")
-        .flag("-Xcompiler")
-        .flag("-Wno-unknown-pragmas")
-        .flag("-Xcompiler")
-        .flag("-Wno-maybe-uninitialized")
-        .flag("--maxrregcount=128");
-
-    // Only enable verbose ptxas output if CUDA_VERBOSE=1
-    if std::env::var("CUDA_VERBOSE").is_ok() {
-        cgbn_build.flag("--ptxas-options=-v");
-    }
-
-    // Enable debug logging if BW6_DEBUG env var is set
-    if std::env::var("BW6_DEBUG").is_ok() {
-        cgbn_build.define("BW6_DEBUG", None);
-    }
-
-    cgbn_build
-        .include("sppark")
-        .include("sppark/blst/src")
-        .include(&cuda_include)
-        .include(cgbn_include)
-        .include("/usr/include")                    // For gmp.h
-        .include("/usr/include/x86_64-linux-gnu")   // For gmp.h (arch-specific)
-        .file("src/msm_bw6_761_cgbn.cu");
-
-    // Try to compile CGBN kernel
-    if let Err(e) = cgbn_build.try_compile("msm_bw6_cgbn") {
-        println!("cargo:warning=CGBN BW6-761 kernel failed to build: {}", e);
-        println!("cargo:warning=BW6-761 GPU MSM not available");
-    } else {
-        // Link against GMP (required by CGBN)
-        println!("cargo:rustc-link-lib=gmp");
-        println!("cargo:rustc-cfg=bw6_cgbn_available");
-        println!("cargo:warning=BW6-761 CGBN: AVAILABLE (TPI=8, BITS=768)");
-    }
-
-    // Build CGBN-based MNT4-298 kernel
-    let mut mnt4_cgbn_build = cc::Build::new();
-
-    mnt4_cgbn_build
-        .cuda(true)
-        .flag("-std=c++17")
-        .flag("-allow-unsupported-compiler")
-        .flag(&arch_flag)
-        .flag("-rdc=true")
-        .flag("-Xcompiler")
-        .flag("-O3")
-        .flag("-Xcompiler")
-        .flag("-Wno-unknown-pragmas")
-        .flag("-Xcompiler")
-        .flag("-Wno-maybe-uninitialized")
-        .flag("--maxrregcount=128");
-
-    // Only enable verbose ptxas output if CUDA_VERBOSE=1
-    if std::env::var("CUDA_VERBOSE").is_ok() {
-        mnt4_cgbn_build.flag("--ptxas-options=-v");
-    }
-
-    mnt4_cgbn_build
-        .include("sppark")
-        .include("sppark/blst/src")
-        .include(&cuda_include)
-        .include(cgbn_include)
-        .include("/usr/include")                    // For gmp.h
-        .include("/usr/include/x86_64-linux-gnu")   // For gmp.h (arch-specific)
-        .file("src/msm_mnt4_298_cgbn.cu");
-
-    // Try to compile MNT4 CGBN kernel
-    if let Err(e) = mnt4_cgbn_build.try_compile("msm_mnt4_cgbn") {
-        println!("cargo:warning=CGBN MNT4-298 kernel failed to build: {}", e);
-        println!("cargo:warning=MNT4-298 GPU MSM not available");
-    } else {
-        println!("cargo:rustc-cfg=mnt4_cgbn_available");
-        println!("cargo:warning=MNT4-298 CGBN: AVAILABLE (TPI=8, BITS=320)");
-    }
-
-    // Build CGBN-based MNT6-298 kernel
-    let mut mnt6_cgbn_build = cc::Build::new();
-
-    mnt6_cgbn_build
-        .cuda(true)
-        .flag("-std=c++17")
-        .flag("-allow-unsupported-compiler")
-        .flag(&arch_flag)
-        .flag("-rdc=true")
-        .flag("-Xcompiler")
-        .flag("-O3")
-        .flag("-Xcompiler")
-        .flag("-Wno-unknown-pragmas")
-        .flag("-Xcompiler")
-        .flag("-Wno-maybe-uninitialized")
-        .flag("--maxrregcount=128");
-
-    // Only enable verbose ptxas output if CUDA_VERBOSE=1
-    if std::env::var("CUDA_VERBOSE").is_ok() {
-        mnt6_cgbn_build.flag("--ptxas-options=-v");
-    }
-
-    mnt6_cgbn_build
-        .include("sppark")
-        .include("sppark/blst/src")
-        .include(&cuda_include)
-        .include(cgbn_include)
-        .include("/usr/include")                    // For gmp.h
-        .include("/usr/include/x86_64-linux-gnu")   // For gmp.h (arch-specific)
-        .file("src/msm_mnt6_298_cgbn.cu");
-
-    // Try to compile MNT6 CGBN kernel
-    if let Err(e) = mnt6_cgbn_build.try_compile("msm_mnt6_cgbn") {
-        println!("cargo:warning=CGBN MNT6-298 kernel failed to build: {}", e);
-        println!("cargo:warning=MNT6-298 GPU MSM not available");
-    } else {
-        println!("cargo:rustc-cfg=mnt6_cgbn_available");
-        println!("cargo:warning=MNT6-298 CGBN: AVAILABLE (TPI=8, BITS=320)");
-    }
-
     // Build C++ utility files needed by sppark (needs CUDA headers)
     let mut cpp_build = cc::Build::new();
     cpp_build
-        .cuda(true)  // Compile as CUDA to get CUDA headers
+        .cuda(true)
         .flag("-std=c++17")
         .flag("-O3")
-        .flag("-x")
-        .flag("cu")  // Treat as CUDA file
+        .flag("-x").flag("cu")
         .include("sppark")
         .include("sppark/blst/src")
         .include(&cuda_include)
@@ -210,15 +292,10 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", cuda_lib);
             println!("cargo:rustc-link-lib=cudart");
             println!("cargo:rustc-cfg=sppark_cuda_built");
-            // Allow multiple definitions of CUDA kernel functions when linking BLS12-377 and BW6-761 CGBN
-            // Both kernels include the same sppark headers, causing duplicate symbols
             println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
         }
         (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
-            println!(
-                "cargo:warning=Build disabled: {}",
-                err
-            );
+            println!("cargo:warning=Build disabled: {}", err);
             println!("cargo:rustc-cfg=sppark_cuda_stub");
         }
     }
