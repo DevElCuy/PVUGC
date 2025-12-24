@@ -10,6 +10,13 @@
 //! - SP1 SDK generates proofs (calls gnark internally)
 //! - sp1_bridge deserializes gnark output → arkworks types
 //! - Outer circuit wraps the SP1 proof on BW6-761
+//!
+//! **GPU Tests (requires running moongate-server first):**
+//! 1. Start the native moongate server:
+//!    /tmp/sp1-gpu/target/release/moongate-server
+//! 2. Run GPU tests:
+//!    cargo test --release test_sp1_fibonacci_groth16_gpu -- --ignored --nocapture
+//!    RUSTFLAGS="-C target-cpu=native" cargo test --release test_sp1_to_pvugc_real_gpu -- --ignored --nocapture
 
 use ark_bls12_377::{Bls12_377, Fr as Fr377};
 use ark_ff::{PrimeField, UniformRand};
@@ -17,7 +24,7 @@ use ark_groth16::Proof;
 use ark_std::rand::SeedableRng;
 use ark_std::rand::rngs::StdRng;
 
-use sp1_sdk::{ProverClient, SP1Stdin, HashableKey};
+use sp1_sdk::{ProverClient, SP1Stdin, HashableKey, Prover};
 use sp1_sdk::install::try_install_circuit_artifacts;
 
 use arkworks_groth16::sp1_bridge::{
@@ -403,4 +410,298 @@ fn test_sp1_public_inputs() {
     println!("✓ Sp1PublicInputs correctly handles 2 public inputs");
     println!("  - vkey_hash: identifies SP1 program");
     println!("  - committed_values_digest: binds program outputs");
+}
+
+// =============================================================================
+// GPU Tests - Use SP1's CUDA prover for hardware-accelerated proving
+// =============================================================================
+
+/// Default moongate server endpoint for native GPU prover.
+/// Start the server with: /tmp/sp1-gpu/target/release/moongate-server
+const MOONGATE_SERVER_ENDPOINT: &str = "http://localhost:3000/twirp/";
+
+#[test]
+#[ignore] // Run with: cargo test --release test_sp1_fibonacci_groth16_gpu -- --ignored --nocapture
+fn test_sp1_fibonacci_groth16_gpu() {
+    println!("\n=== SP1 Fibonacci Groth16 Proof Test (GPU/CUDA) ===\n");
+
+    // Use external moongate server for native GPU acceleration (no Docker required).
+    // Requires: /tmp/sp1-gpu/target/release/moongate-server running on port 3000
+    let _sp1_allow_deprecated_hooks = EnvVarGuard::set("SP1_ALLOW_DEPRECATED_HOOKS", "true");
+
+    // Create SP1 prover pointing to external moongate server
+    let client = ProverClient::builder()
+        .cuda()
+        .server(MOONGATE_SERVER_ENDPOINT)
+        .build();
+
+    // Setup input
+    let mut stdin = SP1Stdin::new();
+    stdin.write(&10u32); // Compute fib(10)
+
+    // Generate proof using GPU
+    println!("Generating SP1 Groth16 proof with native CUDA (moongate-server)...");
+    let (pk, vk) = client.setup(FIBONACCI_ELF);
+    let proof = client.prove(&pk, &stdin).groth16().run().expect("GPU proving failed");
+
+    println!("  ✓ SP1 GPU proof generated");
+    println!("  VKey hash: {}", vk.bytes32());
+
+    // Get raw proof bytes for bridge
+    let raw_proof = proof.bytes();
+    println!("  Raw proof size: {} bytes", raw_proof.len());
+
+    // Verify with SP1
+    client.verify(&proof, &vk).expect("verification failed");
+    println!("  ✓ SP1 verification passed");
+}
+
+#[test]
+#[ignore] // Run with: RUSTFLAGS="-C target-cpu=native" cargo test --release test_sp1_to_pvugc_real_gpu -- --ignored --nocapture
+fn test_sp1_to_pvugc_real_gpu() {
+    use ark_ec::pairing::Pairing;
+    use ark_ff::BigInteger;
+    use ark_groth16::{prepare_verifying_key, Groth16};
+    use arkworks_groth16::ppe::compute_baked_target;
+    use arkworks_groth16::prover_lean::prove_lean_with_randomizers;
+    use arkworks_groth16::pvugc_outer::build_pvugc_setup_from_pk_for_with_samples;
+    use arkworks_groth16::pvugc_outer::{
+        arm_columns_outer_for, build_column_bases_outer_for, compute_r_to_rho_outer_for,
+        compute_target_outer_for,
+    };
+    use arkworks_groth16::decap::build_commitments;
+    use arkworks_groth16::ct::gt_eq_ct;
+    use ark_relations::r1cs::{ConstraintSystem, ConstraintSynthesizer};
+    use std::collections::HashMap;
+
+    println!("\n=== SP1 → PVUGC Real E2E Test (GPU/CUDA, Lean verify, quotient-gap setup) ===\n");
+
+    // Use external moongate server for native GPU acceleration (no Docker required).
+    // Requires: /tmp/sp1-gpu/target/release/moongate-server running on port 3000
+    let _sp1_allow_deprecated_hooks = EnvVarGuard::set("SP1_ALLOW_DEPRECATED_HOOKS", "true");
+
+    let mut rng = StdRng::seed_from_u64(42);
+    type Cycle = Bls12Bw6Cycle;
+
+    // Step 1: Generate N=3 real SP1 Groth16 proofs using GPU
+    println!("Step 1: Generating 4 different SP1 Groth16 proofs with native CUDA (3 setup samples + 1 runtime)...");
+    let client = ProverClient::builder()
+        .cuda()
+        .server(MOONGATE_SERVER_ENDPOINT)
+        .build();
+
+    let (pk_fib, vk_fib) = client.setup(FIBONACCI_ELF);
+    let (pk_ssz, vk_ssz) = client.setup(SSZ_WITHDRAWALS_ELF);
+    let (pk_tendermint, vk_tendermint) = client.setup(TENDERMINT_ELF);
+
+    let mut stdin_1 = SP1Stdin::new();
+    stdin_1.write(&10u32);
+    let sp1_sample_1 = client
+        .prove(&pk_fib, &stdin_1)
+        .groth16()
+        .run()
+        .expect("GPU sample proving #1 (fib) failed");
+
+    let mut stdin_2 = SP1Stdin::new();
+    stdin_2.write(&11u32);
+    let sp1_sample_2 = client
+        .prove(&pk_fib, &stdin_2)
+        .groth16()
+        .run()
+        .expect("GPU sample proving #2 (fib) failed");
+
+    let stdin_3: SP1Stdin = bincode::deserialize(test_artifacts::SSZ_WITHDRAWALS_INPUT_BIN)
+        .expect("deserialize ssz-withdrawals stdin");
+    let sp1_sample_3 = client
+        .prove(&pk_ssz, &stdin_3)
+        .groth16()
+        .run()
+        .expect("GPU sample proving #3 (ssz-withdrawals) failed");
+
+    println!("  ✓ SP1 GPU setup-sample proofs generated (3 samples)");
+    println!("  Program vkey_hash (fib): {}", vk_fib.bytes32());
+    println!("  Program vkey_hash (ssz-withdrawals): {}", vk_ssz.bytes32());
+    println!("  Program vkey_hash (tendermint runtime): {}", vk_tendermint.bytes32());
+
+    // Step 2: Bridge to arkworks
+    println!("\nStep 2: Bridging to arkworks...");
+
+    // For GPU mode, use production artifacts path
+    let artifacts_dir = try_install_circuit_artifacts("groth16");
+
+    let groth16_vk_path = artifacts_dir.join("groth16_vk.bin");
+    let vk_bytes = std::fs::read(&groth16_vk_path).unwrap_or_else(|e| {
+        panic!("read groth16_vk.bin at {}: {e}", groth16_vk_path.display())
+    });
+    let inner_vk = parse_gnark_vk_bls12_377(&vk_bytes).expect("parse gnark raw vk");
+    let inner_pvk = prepare_verifying_key(&inner_vk);
+
+    let stmt_key = |s: &[Fr377]| -> Vec<u8> {
+        s.iter().flat_map(|x| x.into_bigint().to_bytes_le()).collect()
+    };
+
+    let bridge_sp1 = |label: &str, proof: &sp1_sdk::SP1Proof| -> (Vec<Fr377>, Proof<Bls12_377>) {
+        let (raw_proof_hex, public_inputs_hex) = match proof {
+            sp1_sdk::SP1Proof::Groth16(p) => (p.raw_proof.clone(), p.public_inputs.clone()),
+            other => panic!("expected Groth16 proof, got {other}"),
+        };
+
+        let proof_bytes = decode_sp1_proof_hex(&raw_proof_hex).expect("decode raw_proof hex");
+        let inner_proof = parse_gnark_proof_bls12_377(&proof_bytes).expect("parse gnark raw proof");
+
+        let vkey_hash_fe = decode_sp1_public_input(&public_inputs_hex[0]).expect("decode vkey_hash");
+        let committed_values_digest_fe =
+            decode_sp1_public_input(&public_inputs_hex[1]).expect("decode committed_values_digest");
+        let statement = vec![vkey_hash_fe, committed_values_digest_fe];
+
+        assert!(
+            Groth16::<Bls12_377>::verify_proof(&inner_pvk, &inner_proof, &statement).unwrap(),
+            "[{label}] bridged gnark proof failed arkworks verification"
+        );
+        (statement, inner_proof)
+    };
+
+    let (s1, p1) = bridge_sp1("sample#1", &sp1_sample_1.proof);
+    let (s2, p2) = bridge_sp1("sample#2", &sp1_sample_2.proof);
+    let (s3, p3) = bridge_sp1("sample#3", &sp1_sample_3.proof);
+
+    // Sanity check outer-circuit R1CS shape
+    let mut baseline_outer_shape: Option<(usize, usize, usize)> = None;
+    for (i, (stmt, prf)) in [(&s1, &p1), (&s2, &p2), (&s3, &p3)].into_iter().enumerate() {
+        let circuit = OuterCircuit::<Cycle>::new(inner_vk.clone(), stmt.clone(), prf.clone());
+        let cs = ConstraintSystem::<OuterScalar<Cycle>>::new_ref();
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("outer constraint synthesis failed (sample)");
+        assert!(
+            cs.is_satisfied().expect("outer satisfiability check failed (sample)"),
+            "outer circuit unsatisfied for setup sample #{i}"
+        );
+        let shape = (
+            cs.num_constraints(),
+            cs.num_instance_variables(),
+            cs.num_witness_variables(),
+        );
+        if let Some(base) = baseline_outer_shape {
+            assert_eq!(
+                shape, base,
+                "outer R1CS shape mismatch across setup samples: sample#{i}={shape:?} vs baseline={base:?}"
+            );
+        } else {
+            baseline_outer_shape = Some(shape);
+        }
+    }
+
+    // Step 3: Outer setup + PVUGC lean setup
+    println!("\nStep 3: Outer setup + PVUGC lean setup (compute q_const from gap)...");
+    let (pk_outer, vk_outer) =
+        setup_outer_params_for::<Cycle>(&inner_vk, 2, &mut rng)
+            .expect("outer setup failed");
+
+    let mut proof_by_stmt: HashMap<Vec<u8>, Proof<Bls12_377>> = HashMap::new();
+    proof_by_stmt.insert(stmt_key(&s1), p1.clone());
+    proof_by_stmt.insert(stmt_key(&s2), p2.clone());
+    proof_by_stmt.insert(stmt_key(&s3), p3.clone());
+
+    let sample_statements = vec![s1.clone(), s2.clone(), s3.clone()];
+    let inner_proof_generator = move |statement: &[Fr377]| -> Proof<Bls12_377> {
+        let k = stmt_key(statement);
+        proof_by_stmt
+            .get(&k)
+            .cloned()
+            .unwrap_or_else(|| panic!("no cached inner proof for requested statement (len={})", statement.len()))
+    };
+
+    let (pvugc_vk, lean_pk) = build_pvugc_setup_from_pk_for_with_samples::<Cycle, _>(
+        &pk_outer,
+        &inner_vk,
+        inner_proof_generator,
+        sample_statements,
+    );
+    println!("  ✓ PVUGC lean setup complete");
+
+    // Step 4: Runtime proof with GPU + verify + decap
+    println!("\nStep 4: Lean-prove outer circuit for runtime SP1 statement (GPU) and verify full pipeline...");
+
+    let stdin_rt: SP1Stdin =
+        bincode::deserialize(test_artifacts::TENDERMINT_INPUT_BIN).expect("deserialize tendermint stdin");
+    let (public_values_rt, _report_rt) = client
+        .execute(TENDERMINT_ELF, &stdin_rt)
+        .run()
+        .expect("tendermint execute failed");
+    let vkey_hash_rt = vk_tendermint.bytes32();
+    let committed_values_digest_rt = public_values_rt.hash_bn254().to_string();
+    let s_rt = vec![
+        decode_sp1_public_input(&vkey_hash_rt).expect("decode runtime vkey_hash"),
+        decode_sp1_public_input(&committed_values_digest_rt).expect("decode runtime committed_values_digest"),
+    ];
+
+    // Arm for runtime statement
+    let rho = OuterScalar::<Cycle>::rand(&mut rng);
+    let public_inputs_outer_rt: Vec<OuterScalar<Cycle>> =
+        s_rt.iter().map(|x| fr_inner_to_outer_for::<Cycle>(x)).collect();
+    let bases_rt = build_column_bases_outer_for::<Cycle>(&pvugc_vk, &vk_outer, &public_inputs_outer_rt);
+    let col_arms_rt = arm_columns_outer_for::<Cycle>(&bases_rt, &rho);
+
+    let r_target_rt = compute_target_outer_for::<Cycle>(&vk_outer, &pvugc_vk, &s_rt);
+    let k_expected_rt = compute_r_to_rho_outer_for::<Cycle>(&r_target_rt, &rho);
+
+    // Generate runtime proof with GPU
+    let sp1_runtime = client
+        .prove(&pk_tendermint, &stdin_rt)
+        .groth16()
+        .run()
+        .expect("GPU runtime proving (tendermint) failed");
+    println!("  ✓ SP1 GPU runtime proof generated (tendermint)");
+    let (s_rt_from_proof, p_rt) = bridge_sp1("runtime", &sp1_runtime.proof);
+    assert_eq!(
+        s_rt_from_proof, s_rt,
+        "runtime proof public inputs must match the pre-armed statement"
+    );
+
+    let mut prove_verify_and_decap =
+        |label: &str, statement: &[Fr377], inner_proof: &Proof<Bls12_377>| {
+            let circuit = OuterCircuit::<Cycle>::new(inner_vk.clone(), statement.to_vec(), inner_proof.clone());
+            let r = OuterScalar::<Cycle>::rand(&mut rng);
+            let s = OuterScalar::<Cycle>::rand(&mut rng);
+            let (proof_outer_lean, assignment) =
+                prove_lean_with_randomizers(&lean_pk, circuit, r, s).expect("lean proving failed");
+
+            let public_inputs_outer: Vec<OuterScalar<Cycle>> =
+                statement.iter().map(|x| fr_inner_to_outer_for::<Cycle>(x)).collect();
+            let r_baked = compute_baked_target(&vk_outer, &pvugc_vk, &public_inputs_outer)
+                .expect("compute baked target");
+
+            let lhs = <Cycle as RecursionCycle>::OuterE::pairing(proof_outer_lean.a, proof_outer_lean.b);
+            let rhs =
+                r_baked + <Cycle as RecursionCycle>::OuterE::pairing(proof_outer_lean.c, vk_outer.delta_g2);
+            assert_eq!(lhs, rhs, "[{label}] Lean outer proof failed baked-target verification");
+
+            let num_instance = vk_outer.gamma_abc_g1.len();
+            let commitments = build_commitments::<<Cycle as RecursionCycle>::OuterE>(
+                &proof_outer_lean.a,
+                &proof_outer_lean.c,
+                &s,
+                &assignment,
+                num_instance,
+            );
+            let k_decapped =
+                arkworks_groth16::decap::decap(&commitments, &col_arms_rt).expect("decap failed");
+            assert!(
+                gt_eq_ct::<<Cycle as RecursionCycle>::OuterE>(&k_decapped, &k_expected_rt),
+                "[{label}] decapped key mismatch: expected R^rho for runtime statement"
+            );
+
+            println!("  ✓ [{label}] Lean outer proof verified (baked target) + PVUGC decap ok");
+            k_decapped
+        };
+
+    let k1 = prove_verify_and_decap("runtime#1", &s_rt, &p_rt);
+    let k2 = prove_verify_and_decap("runtime#2", &s_rt, &p_rt);
+    assert!(
+        gt_eq_ct::<<Cycle as RecursionCycle>::OuterE>(&k1, &k2),
+        "proof-agnostic decap failed: two outer proofs for same statement should decap to same key"
+    );
+
+    println!("\n=== SP1 → PVUGC Real E2E Test (GPU/CUDA, Lean verify) PASSED ===");
 }
