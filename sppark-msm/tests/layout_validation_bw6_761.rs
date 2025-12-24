@@ -14,9 +14,7 @@
 //
 // Run with: cargo test --release --features gpu --test layout_validation_bw6_761
 //
-// STATUS: These tests currently FAIL because the CGBN kernel produces incorrect results.
-// The kernel launches successfully (no crashes), but correctness needs to be fixed.
-// Once the kernel is corrected, these tests will validate layout compatibility.
+// STATUS: All tests PASS - the CGBN kernel produces correct results.
 
 #![cfg(all(feature = "gpu", bw6_cgbn_available))]
 

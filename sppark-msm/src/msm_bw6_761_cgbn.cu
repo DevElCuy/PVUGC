@@ -28,9 +28,10 @@ public:
   static const uint32_t BITS = 768;         // Round up from 761 bits
 };
 
-// BW6-761 base field modulus (from sppark/ff/bw6-761.hpp)
+// BW6-761 base field modulus (verified against arkworks Fq::MODULUS)
+// Note: This is BigInt<12> converted to u32[24] in little-endian order
 __device__ __constant__ uint32_t BW6_761_P_DEVICE[24] = {
-    0x0000008b, 0xf49d0000, 0x00000082, 0xe6913e68,
+    0x0000008b, 0xf49d0000, 0x70000082, 0xe6913e68,
     0xeaf0a437, 0x160cf8ae, 0x5667a8f8, 0x98a116c2,
     0x73ebff2e, 0x71dcd3dc, 0x12f9fd90, 0x8689c8ed,
     0x25b42304, 0x03cebaff, 0xe584e919, 0x707ba638,
@@ -116,87 +117,116 @@ public:
 
   /**
    * Field subtraction with modular reduction: r = (a - b) mod P
+   *
+   * CRITICAL: CGBN uses unsigned arithmetic. cgbn_sub returns a borrow flag
+   * indicating underflow, NOT a negative number. We must use the return value
+   * to detect when we need to add the modulus.
    */
   __device__ __forceinline__ void field_sub(bn_t& r, const bn_t& a,
                                              const bn_t& b, const bn_t& P) {
-    cgbn_sub(_env, r, a, b);
-    // If result is negative, add modulus
-    if (cgbn_compare_ui32(_env, r, 0) < 0) {
+    // cgbn_sub returns 1 if there was a borrow (underflow), 0 otherwise
+    int32_t borrow = cgbn_sub(_env, r, a, b);
+    if (borrow != 0) {
       cgbn_add(_env, r, r, P);
     }
   }
 
   /**
    * Field multiplication with modular reduction: r = (a * b) mod P
+   *
+   * CRITICAL: Must use wide multiplication (cgbn_mul_wide) because:
+   * - a, b are up to 761 bits each
+   * - a * b is up to 1522 bits (doesn't fit in 768-bit bn_t)
+   * - cgbn_mul only keeps the low 768 bits, losing upper bits!
+   * - Must use cgbn_rem_wide to compute (full_product) mod P
    */
   __device__ __forceinline__ void field_mul(bn_t& r, const bn_t& a,
                                              const bn_t& b, const bn_t& P) {
-    cgbn_mul(_env, r, a, b);
-    cgbn_rem(_env, r, r, P);
+    // Wide type holds 2*BITS = 1536 bits, enough for 761*2 = 1522 bit product
+    typedef typename env_t::cgbn_wide_t wide_t;
+    wide_t product;
+
+    // Full multiplication: product = a * b (up to 1522 bits)
+    cgbn_mul_wide(_env, product, a, b);
+
+    // Wide remainder: r = product mod P
+    cgbn_rem_wide(_env, r, product, P);
   }
 
   /**
    * Point Addition: XYZZ + Affine → XYZZ (Mixed Addition)
    *
-   * Formulas from test_cgbn_point_add.cu (validated)
+   * XYZZ Mixed Addition Formulas from hyperelliptic.org "madd-2008-s":
+   * https://www.hyperelliptic.org/EFD/g1p/auto-shortw-xyzz.html
+   *
+   * In XYZZ form: point (X, Y, ZZ, ZZZ) represents affine (X/ZZ, Y/ZZZ)
+   * where ZZ = Z^2, ZZZ = Z^3
+   *
+   * Formulas (mixed addition with affine point where Z2=1, ZZ2=1, ZZZ2=1):
+   *   U2 = X2*ZZ1
+   *   S2 = Y2*ZZZ1
+   *   P = U2-X1
+   *   R = S2-Y1
+   *   PP = P^2
+   *   PPP = P*PP
+   *   Q = X1*PP
+   *   X3 = R^2-PPP-2*Q
+   *   Y3 = R*(Q-X3)-Y1*PPP
+   *   ZZ3 = ZZ1*PP
+   *   ZZZ3 = ZZZ1*PPP
+   *
    * All TPI threads must call this together
    */
   __device__ __forceinline__ void point_add_mixed(
-      const bn_t& P,
+      const bn_t& P_mod,
       // Result (XYZZ)
       bn_t& X3, bn_t& Y3, bn_t& ZZ3, bn_t& ZZZ3,
-      // First operand (XYZZ)
+      // First operand (XYZZ): represents affine (X1/ZZ1, Y1/ZZZ1)
       const bn_t& X1, const bn_t& Y1,
       const bn_t& ZZ1, const bn_t& ZZZ1,
-      // Second operand (Affine)
+      // Second operand (Affine): (X2, Y2) with implicit Z2=1
       const bn_t& X2, const bn_t& Y2
   ) {
-    bn_t U1, U2, S1, S2, H, R, HH, HHH, V, temp;
+    bn_t U2, S2, P, R, PP, PPP, Q, temp;
 
-    // U1 = X1 * ZZ1
-    field_mul(U1, X1, ZZ1, P);
+    // U2 = X2 * ZZ1 (scale affine X2 to match XYZZ coordinate system)
+    field_mul(U2, X2, ZZ1, P_mod);
 
-    // U2 = X2 (affine, so Z2=1)
-    cgbn_set(_env, U2, X2);
+    // S2 = Y2 * ZZZ1 (scale affine Y2 to match XYZZ coordinate system)
+    field_mul(S2, Y2, ZZZ1, P_mod);
 
-    // S1 = Y1 * ZZZ1
-    field_mul(S1, Y1, ZZZ1, P);
+    // P = U2 - X1 (difference in scaled x-coordinates)
+    field_sub(P, U2, X1, P_mod);
 
-    // S2 = Y2
-    cgbn_set(_env, S2, Y2);
+    // R = S2 - Y1 (difference in scaled y-coordinates)
+    field_sub(R, S2, Y1, P_mod);
 
-    // H = U2 - U1
-    field_sub(H, U2, U1, P);
+    // PP = P^2
+    field_mul(PP, P, P, P_mod);
 
-    // R = S2 - S1
-    field_sub(R, S2, S1, P);
+    // PPP = P * PP = P^3
+    field_mul(PPP, P, PP, P_mod);
 
-    // HH = H^2
-    field_mul(HH, H, H, P);
+    // Q = X1 * PP
+    field_mul(Q, X1, PP, P_mod);
 
-    // HHH = H * HH
-    field_mul(HHH, H, HH, P);
+    // X3 = R^2 - PPP - 2*Q
+    field_mul(X3, R, R, P_mod);
+    field_sub(X3, X3, PPP, P_mod);
+    field_sub(X3, X3, Q, P_mod);
+    field_sub(X3, X3, Q, P_mod);
 
-    // V = U1 * HH
-    field_mul(V, U1, HH, P);
+    // Y3 = R*(Q - X3) - Y1*PPP
+    field_sub(temp, Q, X3, P_mod);
+    field_mul(Y3, R, temp, P_mod);
+    field_mul(temp, Y1, PPP, P_mod);
+    field_sub(Y3, Y3, temp, P_mod);
 
-    // X3 = R^2 - HHH - 2*V
-    field_mul(X3, R, R, P);
-    field_sub(X3, X3, HHH, P);
-    field_sub(X3, X3, V, P);
-    field_sub(X3, X3, V, P);
+    // ZZ3 = ZZ1 * PP
+    field_mul(ZZ3, ZZ1, PP, P_mod);
 
-    // Y3 = R*(V - X3) - S1*HHH
-    field_sub(temp, V, X3, P);
-    field_mul(Y3, R, temp, P);
-    field_mul(temp, S1, HHH, P);
-    field_sub(Y3, Y3, temp, P);
-
-    // ZZ3 = ZZ1 * HH
-    field_mul(ZZ3, ZZ1, HH, P);
-
-    // ZZZ3 = ZZZ1 * HHH
-    field_mul(ZZZ3, ZZZ1, HHH, P);
+    // ZZZ3 = ZZZ1 * PPP
+    field_mul(ZZZ3, ZZZ1, PPP, P_mod);
   }
 
   /**
@@ -387,11 +417,28 @@ public:
   /**
    * Point Addition: XYZZ + XYZZ → XYZZ (Full Addition)
    *
-   * Similar to mixed addition but both operands are in projective form
+   * XYZZ Full Addition Formulas from hyperelliptic.org "add-2008-s":
+   * https://www.hyperelliptic.org/EFD/g1p/auto-shortw-xyzz.html
+   *
+   * Formulas:
+   *   U1 = X1*ZZ2
+   *   U2 = X2*ZZ1
+   *   S1 = Y1*ZZZ2
+   *   S2 = Y2*ZZZ1
+   *   P = U2-U1
+   *   R = S2-S1
+   *   PP = P^2
+   *   PPP = P*PP
+   *   Q = U1*PP
+   *   X3 = R^2 - PPP - 2*Q
+   *   Y3 = R*(Q-X3) - S1*PPP
+   *   ZZ3 = ZZ1*ZZ2*PP
+   *   ZZZ3 = ZZZ1*ZZZ2*PPP
+   *
    * All TPI threads must call this together
    */
   __device__ __forceinline__ void point_add(
-      const bn_t& P,
+      const bn_t& P_mod,
       // Result (XYZZ)
       bn_t& X3, bn_t& Y3, bn_t& ZZ3, bn_t& ZZZ3,
       // First operand (XYZZ)
@@ -401,54 +448,54 @@ public:
       const bn_t& X2, const bn_t& Y2,
       const bn_t& ZZ2, const bn_t& ZZZ2
   ) {
-    bn_t U1, U2, S1, S2, H, R, HH, HHH, V, temp;
+    bn_t U1, U2, S1, S2, P, R, PP, PPP, Q, temp;
 
     // U1 = X1 * ZZ2
-    field_mul(U1, X1, ZZ2, P);
+    field_mul(U1, X1, ZZ2, P_mod);
 
     // U2 = X2 * ZZ1
-    field_mul(U2, X2, ZZ1, P);
+    field_mul(U2, X2, ZZ1, P_mod);
 
     // S1 = Y1 * ZZZ2
-    field_mul(S1, Y1, ZZZ2, P);
+    field_mul(S1, Y1, ZZZ2, P_mod);
 
     // S2 = Y2 * ZZZ1
-    field_mul(S2, Y2, ZZZ1, P);
+    field_mul(S2, Y2, ZZZ1, P_mod);
 
-    // H = U2 - U1
-    field_sub(H, U2, U1, P);
+    // P = U2 - U1
+    field_sub(P, U2, U1, P_mod);
 
     // R = S2 - S1
-    field_sub(R, S2, S1, P);
+    field_sub(R, S2, S1, P_mod);
 
-    // HH = H^2
-    field_mul(HH, H, H, P);
+    // PP = P^2
+    field_mul(PP, P, P, P_mod);
 
-    // HHH = H * HH
-    field_mul(HHH, H, HH, P);
+    // PPP = P * PP = P^3
+    field_mul(PPP, P, PP, P_mod);
 
-    // V = U1 * HH
-    field_mul(V, U1, HH, P);
+    // Q = U1 * PP
+    field_mul(Q, U1, PP, P_mod);
 
-    // X3 = R^2 - HHH - 2*V
-    field_mul(X3, R, R, P);
-    field_sub(X3, X3, HHH, P);
-    field_sub(X3, X3, V, P);
-    field_sub(X3, X3, V, P);
+    // X3 = R^2 - PPP - 2*Q
+    field_mul(X3, R, R, P_mod);
+    field_sub(X3, X3, PPP, P_mod);
+    field_sub(X3, X3, Q, P_mod);
+    field_sub(X3, X3, Q, P_mod);
 
-    // Y3 = R*(V - X3) - S1*HHH
-    field_sub(temp, V, X3, P);
-    field_mul(Y3, R, temp, P);
-    field_mul(temp, S1, HHH, P);
-    field_sub(Y3, Y3, temp, P);
+    // Y3 = R*(Q - X3) - S1*PPP
+    field_sub(temp, Q, X3, P_mod);
+    field_mul(Y3, R, temp, P_mod);
+    field_mul(temp, S1, PPP, P_mod);
+    field_sub(Y3, Y3, temp, P_mod);
 
-    // ZZ3 = ZZ1 * ZZ2 * HH
-    field_mul(ZZ3, ZZ1, ZZ2, P);
-    field_mul(ZZ3, ZZ3, HH, P);
+    // ZZ3 = ZZ1 * ZZ2 * PP
+    field_mul(ZZ3, ZZ1, ZZ2, P_mod);
+    field_mul(ZZ3, ZZ3, PP, P_mod);
 
-    // ZZZ3 = ZZZ1 * ZZZ2 * HHH
-    field_mul(ZZZ3, ZZZ1, ZZZ2, P);
-    field_mul(ZZZ3, ZZZ3, HHH, P);
+    // ZZZ3 = ZZZ1 * ZZZ2 * PPP
+    field_mul(ZZZ3, ZZZ1, ZZZ2, P_mod);
+    field_mul(ZZZ3, ZZZ3, PPP, P_mod);
   }
 
   /**
@@ -643,14 +690,80 @@ __global__ void msm_naive_cgbn_kernel(
                 __syncthreads();
             } else {
                 // Add to accumulator: acc = acc + term
+                // CRITICAL: Must handle three cases:
+                // 1. acc == term (same point) → use doubling
+                // 2. acc == -term (inverse points) → result is infinity
+                // 3. acc != term and acc != -term → use standard addition
                 typename bw6_msm_t<params>::bn_t new_x, new_y, new_zz, new_zzz;
-                msm.point_add(P, new_x, new_y, new_zz, new_zzz,
-                             acc_x, acc_y, acc_zz, acc_zzz,
-                             term_x, term_y, term_zz, term_zzz);
-                cgbn_set(msm._env, acc_x, new_x);
-                cgbn_set(msm._env, acc_y, new_y);
-                cgbn_set(msm._env, acc_zz, new_zz);
-                cgbn_set(msm._env, acc_zzz, new_zzz);
+
+                // Check if points are equal or inverse by comparing affine coordinates:
+                // acc represents (acc_x/acc_zz, acc_y/acc_zzz)
+                // term represents (term_x/term_zz, term_y/term_zzz)
+                //
+                // X-coords equal if: acc_x * term_zz == term_x * acc_zz
+                // Y-coords equal if: acc_y * term_zzz == term_y * acc_zzz
+                // Y-coords are negatives if: acc_y * term_zzz + term_y * acc_zzz == 0 (mod P)
+                //   equivalently: acc_y * term_zzz == P - (term_y * acc_zzz)
+                typename bw6_msm_t<params>::bn_t cross1, cross2, cross3, cross4;
+                msm.field_mul(cross1, acc_x, term_zz, P);
+                msm.field_mul(cross2, term_x, acc_zz, P);
+                msm.field_mul(cross3, acc_y, term_zzz, P);
+                msm.field_mul(cross4, term_y, acc_zzz, P);
+
+                // Compare x-coordinates
+                bool x_equal = (cgbn_compare(msm._env, cross1, cross2) == 0);
+
+                // Compare y-coordinates (both same and opposite)
+                bool y_equal = (cgbn_compare(msm._env, cross3, cross4) == 0);
+
+                // Check if y-coords are negatives: cross3 + cross4 == 0 mod P
+                // i.e., cross3 + cross4 == P (since both are already reduced mod P)
+                typename bw6_msm_t<params>::bn_t y_sum;
+                cgbn_add(msm._env, y_sum, cross3, cross4);
+                cgbn_rem(msm._env, y_sum, y_sum, P);
+                bool y_opposite = cgbn_equals_ui32(msm._env, y_sum, 0);
+
+                bool points_equal = x_equal && y_equal;
+                bool points_inverse = x_equal && y_opposite && !y_equal;
+
+                if (points_inverse) {
+                    // Points are inverses: P + (-P) = O (point at infinity)
+                    acc_is_infinity = true;
+                    if (threadIdx.x == 0) {
+                        shared_acc_is_infinity = true;
+                    }
+                    __syncthreads();
+                } else if (points_equal) {
+                    // Points are equal: use doubling formula (2*acc)
+                    msm.point_double(P, new_x, new_y, new_zz, new_zzz,
+                                    acc_x, acc_y, acc_zz, acc_zzz);
+                    cgbn_set(msm._env, acc_x, new_x);
+                    cgbn_set(msm._env, acc_y, new_y);
+                    cgbn_set(msm._env, acc_zz, new_zz);
+                    cgbn_set(msm._env, acc_zzz, new_zzz);
+                } else {
+                    // Points are different: use standard addition
+                    msm.point_add(P, new_x, new_y, new_zz, new_zzz,
+                                 acc_x, acc_y, acc_zz, acc_zzz,
+                                 term_x, term_y, term_zz, term_zzz);
+
+                    // After addition, check if result is infinity (ZZ == 0)
+                    // This can happen if points were inverses but our check above missed it
+                    // (e.g., due to different XYZZ representations of the same affine point)
+                    bool result_is_zero = cgbn_equals_ui32(msm._env, new_zz, 0);
+                    if (result_is_zero) {
+                        acc_is_infinity = true;
+                        if (threadIdx.x == 0) {
+                            shared_acc_is_infinity = true;
+                        }
+                        __syncthreads();
+                    } else {
+                        cgbn_set(msm._env, acc_x, new_x);
+                        cgbn_set(msm._env, acc_y, new_y);
+                        cgbn_set(msm._env, acc_zz, new_zz);
+                        cgbn_set(msm._env, acc_zzz, new_zzz);
+                    }
+                }
             }
         }
     }
@@ -671,6 +784,21 @@ __global__ void msm_naive_cgbn_kernel(
         // Convert XYZZ to Jacobian and store
         msm.xyzz_to_jacobian(P, result_out, acc_x, acc_y, acc_zz, acc_zzz);
     }
+}
+
+// Debug: Print first few limbs of a bn_t (only from lane 0)
+template<class params>
+__device__ void debug_print_bn(bw6_msm_t<params>& msm, const char* name, const typename bw6_msm_t<params>::bn_t& x) {
+#ifdef BW6_DEBUG
+    // Store to temp memory and print
+    cgbn_mem_t<params::BITS> temp;
+    cgbn_store(msm._env, &temp, x);
+    if (threadIdx.x == 0) {
+        printf("  %s: [0x%08x, 0x%08x, 0x%08x, 0x%08x, ...]\n",
+               name, temp._limbs[0], temp._limbs[1], temp._limbs[2], temp._limbs[3]);
+    }
+    __syncthreads();
+#endif
 }
 
 /**

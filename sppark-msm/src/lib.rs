@@ -237,6 +237,7 @@ pub fn msm_bw6_761_gpu_cgbn(
     scalars: &[BigInt<6>],
 ) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
     use ark_ff::PrimeField;
+    use ark_bw6_761::Fq;
 
     if points.len() != scalars.len() {
         return Err(Bw6GpuError::Unknown(-99)); // argument mismatch
@@ -256,6 +257,17 @@ pub fn msm_bw6_761_gpu_cgbn(
         _padding: [u8; 7],  // Match CUDA alignment (200 bytes total)
     }
 
+    // Plain form Jacobian/Projective point (output from CUDA)
+    // CUDA returns normalized affine coordinates as Jacobian with Z=1
+    #[repr(C)]
+    struct PlainG1Projective {
+        x: [u32; 24],  // CUDA returns uint32_t[24] (96 bytes)
+        y: [u32; 24],  // CUDA returns uint32_t[24] (96 bytes)
+        z: [u32; 24],  // CUDA returns uint32_t[24] (96 bytes) - should be 1 for normalized
+        infinity: bool,
+        _padding: [u8; 7],  // Match CUDA alignment
+    }
+
     // Helper: convert BigInt<12> (u64[12]) to [u32; 24]
     fn bigint_to_u32_array(bigint: ark_ff::BigInt<12>) -> [u32; 24] {
         let mut result = [0u32; 24];
@@ -265,6 +277,16 @@ pub fn msm_bw6_761_gpu_cgbn(
             result[i * 2 + 1] = (limb_u64 >> 32) as u32; // Upper 32 bits
         }
         result
+    }
+
+    // Helper: convert [u32; 24] back to BigInt<12> (u64[12])
+    fn u32_array_to_bigint(arr: &[u32; 24]) -> ark_ff::BigInt<12> {
+        let mut limbs = [0u64; 12];
+        for i in 0..12 {
+            // Combine two u32s into one u64 (little-endian)
+            limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+        }
+        ark_ff::BigInt(limbs)
     }
 
     let plain_points: Vec<PlainG1Affine> = points.iter().map(|p| {
@@ -288,22 +310,48 @@ pub fn msm_bw6_761_gpu_cgbn(
         }
     }).collect();
 
-    let mut result = ark_bw6_761::G1Projective::default();
+    // Use PlainG1Projective to receive CUDA output (plain form coordinates)
+    let mut plain_result = PlainG1Projective {
+        x: [0u32; 24],
+        y: [0u32; 24],
+        z: [0u32; 24],
+        infinity: false,
+        _padding: [0u8; 7],
+    };
+
     let status = unsafe {
         msm_bw6_761_g1_cgbn(
             plain_points.as_ptr() as *const ark_bw6_761::G1Affine,
             scalars.as_ptr(),
             points.len(),
-            &mut result,
+            &mut plain_result as *mut PlainG1Projective as *mut ark_bw6_761::G1Projective,
             core::mem::size_of::<PlainG1Affine>(),
             core::mem::size_of::<BigInt<6>>(),
         )
     };
-    if status == 0 {
-        Ok(result)
-    } else {
-        Err(Bw6GpuError::from_status(status))
+
+    if status != 0 {
+        return Err(Bw6GpuError::from_status(status));
     }
+
+    // Handle infinity case
+    if plain_result.infinity {
+        return Ok(ark_bw6_761::G1Projective::default());
+    }
+
+    // Convert plain form coordinates back to Montgomery form
+    // from_bigint() converts plain → Montgomery: x → x * R mod p
+    let x_bigint = u32_array_to_bigint(&plain_result.x);
+    let y_bigint = u32_array_to_bigint(&plain_result.y);
+    let z_bigint = u32_array_to_bigint(&plain_result.z);
+
+    // Convert BigInt to Fq (Montgomery form)
+    let x_fq = Fq::from_bigint(x_bigint).ok_or(Bw6GpuError::Unknown(-100))?;
+    let y_fq = Fq::from_bigint(y_bigint).ok_or(Bw6GpuError::Unknown(-101))?;
+    let z_fq = Fq::from_bigint(z_bigint).ok_or(Bw6GpuError::Unknown(-102))?;
+
+    // Construct G1Projective with Montgomery form coordinates
+    Ok(ark_bw6_761::G1Projective::new_unchecked(x_fq, y_fq, z_fq))
 }
 
 #[cfg(not(all(feature = "gpu", bw6_cgbn_available)))]
