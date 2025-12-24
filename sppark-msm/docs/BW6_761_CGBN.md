@@ -187,15 +187,17 @@ fn main() {
 
 | Component | Status |
 |-----------|--------|
-| Field arithmetic (add/sub/mul) | ✅ Working |
-| Point doubling | ✅ Working |
-| Mixed addition (XYZZ + Affine) | ✅ Working |
-| Full addition (XYZZ + XYZZ) | ✅ Working |
+| Field arithmetic (add/sub/mul) | ✅ Working (wide multiplication for correctness) |
+| Point doubling | ✅ Working (XYZZ dbl-2008-s-1 formula) |
+| Mixed addition (XYZZ + Affine) | ✅ Working (XYZZ madd-2008-s formula) |
+| Full addition (XYZZ + XYZZ) | ✅ Working (XYZZ add-2008-s with P==Q doubling check) |
 | Scalar multiplication | ✅ Working (double-and-add) |
 | MSM accumulation | ✅ Working (serial) |
 | Rust FFI | ✅ Working |
-| Montgomery conversion | ✅ Working |
-| Tests | ✅ 5/5 passing |
+| Montgomery conversion | ✅ Working (input: plain form, output: back to Montgomery) |
+| Layout validation tests | ✅ 6/6 passing |
+| CGBN kernel tests | ✅ 5/5 passing |
+| BLS12-377 tests | ✅ 13/13 passing (no regressions) |
 
 ---
 
