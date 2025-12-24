@@ -29,3 +29,9 @@ harness = false
 name = "layout_validation_bw6_761"
 path = "tests/layout_validation_bw6_761.rs"
 harness = false
+
+# CPU vs GPU consistency tests - critical for SP1 e2e validation
+[[test]]
+name = "test_gpu_cpu_consistency"
+path = "tests/test_gpu_cpu_consistency.rs"
+harness = false
