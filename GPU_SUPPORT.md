@@ -4,6 +4,8 @@
 
 This codebase includes GPU acceleration for Multi-Scalar Multiplication (MSM) operations using NVIDIA CUDA via the [sppark](https://github.com/supranational/sppark) library. GPU support is **optional** and controlled by the `gpu` feature flag.
 
+For the documentation tree and prioritized roadmap, see `docs/GPU_INDEX.md` and `GPU_plan.md`.
+
 ## Current Status
 
 ### ✅ Fully Supported: BLS12-377 G1
@@ -45,6 +47,7 @@ ENABLE_CGBN_STUB=1 cargo test --release --features gpu --test layout_validation_
 **Status**: Working via CGBN kernel (experimental)
 **Implementation**: Uses NVIDIA CGBN library with 320-bit field arithmetic (TPI=8)
 **Use Cases**: Outer proofs in the Mnt4Mnt6Cycle
+**Note**: Sparse quotient GPU path is integrated for the MNT cycle (see `docs/MNT_GPU_ACCELERATION.md`); BW6 sparse quotient is still pending (see `GPU_plan.md`).
 
 **Test Command**:
 ```bash
@@ -182,6 +185,17 @@ Layout validation tests ensure correct FFI data layout:
 - `cargo test --features gpu --test layout_validation_mnt4_298`
 - `cargo test --features gpu --test layout_validation_mnt6_298`
 
+### GPU/CPU Integration Tests (Sparse Quotient)
+
+Located in `src/pvugc_outer.rs` module `sparse_quotient_integration_tests`:
+
+- ✅ `test_sparse_quotient_gpu_cpu_consistency` - Full H_ij bases match (30 pairs)
+- ✅ `test_sparse_quotient_gpu_determinism` - Results identical across 3 runs
+- ✅ `test_sparse_quotient_empty_columns` - Edge case handling
+- ✅ `test_sparse_quotient_large_columns` - Stress test (320 combinations)
+
+**Run with**: `cargo test --release --features gpu --lib sparse_quotient_integration_tests`
+
 ### What Tests DON'T Cover
 
 ❌ **G2 operations** - No GPU implementation for any curve
@@ -271,9 +285,22 @@ If you see "size mismatch" or "alignment mismatch" panics:
 
 ## Future Work
 
-### CGBN Kernel Optimizations (BW6-761, MNT4-298, MNT6-298)
+### Priority for SP1 e2e + Lean e2e (ordered by expected gain)
 
-The current CGBN kernels use serial double-and-add (O(n × log(scalar_bits))). Future improvements:
+1. **BW6 sparse-quotient GPU path** (SP1 e2e bottleneck)  
+   Est gain: ~10–30x on quotient phase; ~3–10x overall SP1 e2e.
+2. **Pippenger MSM for CGBN kernels (BW6/MNT)**  
+   Est gain: ~5–15x vs CPU for large MSMs; ~2–6x vs current GPU.
+3. **G1 GPU MSM dispatch in lean prover (BW6 + MNT6)**  
+   Est gain: ~2–8x on MSM-heavy steps; ~1.5–4x overall.
+4. **G2 GPU MSM (BW6/MNT6)**  
+   Est gain: ~1.5–4x on G2 MSM; ~1.1–2x overall.
+5. **GPU pairings (verification path)**  
+   Est gain: ~1.1–1.3x verification time.
+
+### CGBN Kernel Optimizations (Details)
+
+The current CGBN kernels use serial double-and-add (O(n × log(scalar_bits))). Planned improvements:
 
 1. **Pippenger Algorithm**: O(n / log(n)) for large MSMs
 2. **Parallel Scalar Multiplications**: Multiple thread groups + tree reduction
@@ -286,7 +313,7 @@ The current CGBN kernels use serial double-and-add (O(n × log(scalar_bits))). F
 - Point doubling formulas include a*ZZ^2 term for MNT curves
 
 See `sppark-msm/docs/BW6_761_CGBN.md` for CGBN implementation details.
-See `docs/MNT_CGBN_PLAN.md` and `docs/MNT_CGBN_SPEC.md` for MNT implementation details.
+See `sppark-msm/docs/MNT_CGBN.md` and `docs/MNT_GPU_ACCELERATION.md` for MNT implementation details.
 
 ## References
 
@@ -305,4 +332,4 @@ See `docs/MNT_CGBN_PLAN.md` and `docs/MNT_CGBN_SPEC.md` for MNT implementation d
 | *-* G2 | ❌ | N/A | Not implemented | N/A |
 
 ---
-*Last Updated: 2025-12-24*
+*Last Updated: 2025-12-25*

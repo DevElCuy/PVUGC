@@ -25,6 +25,26 @@ BW6-761 has a **761-bit base field** (vs 377-bit for BLS12-377). When using sppa
 
 ---
 
+## Historical: Icicle BW6-761 Research
+
+This section captures the design comparison that led to the CGBN approach.
+
+| Aspect | Icicle | sppark | CGBN (chosen) |
+|--------|--------|--------|---------------|
+| Template design | Flat: `Field<CONFIG>` | Deep: `mont_t` -> `wide_t` -> PTX | Class-based with cooperative groups |
+| Field storage | Simple `storage<N>` array | Template class with inheritance | `cgbn_mem_t<BITS>` (768 bits) |
+| Constants | Compile-time `constexpr` | Runtime device constants | `__device__ __constant__` |
+| Arithmetic | Template functions | Inline PTX assembly | CGBN library functions |
+| Scalability | Works with any limb count | Optimized for <=12 limbs | Works with any size (TPI threads cooperate) |
+
+**Why CGBN won:**
+1. Cooperative group model (TPI=8 threads share work on each big number)
+2. No template explosion for 24-limb fields
+3. Library primitives (`cgbn_add`, `cgbn_mul`, `cgbn_rem`, `cgbn_mont_mul`)
+4. Proven for large fields that exceed register capacity
+
+---
+
 ## Architecture
 
 ### CGBN Parameters
@@ -73,6 +93,33 @@ This conversion happens on the CPU before GPU transfer.
 | `src/msm_bw6_761_cgbn.cu` | CGBN kernel implementation |
 | `src/lib.rs` | Rust FFI with Montgomery conversion |
 | `tests/test_gpu_cgbn_bw6.rs` | Integration tests (custom harness) |
+
+### FFI Layout (BW6-761)
+
+The CUDA structs are defined in `src/msm_bw6_761_cgbn.cu` and use 8-byte alignment
+to match arkworks layouts. The Rust FFI validates sizes at runtime.
+
+```cpp
+// Affine point (input)
+typedef struct {
+    uint32_t x[24];
+    uint32_t y[24];
+    bool infinity;
+} __align__(8) affine_cgbn_t;
+
+// Scalar (Fr element)
+typedef struct {
+    uint32_t limbs[12];
+} __align__(8) scalar_cgbn_t;
+
+// Jacobian point (output)
+typedef struct {
+    uint32_t x[24];
+    uint32_t y[24];
+    uint32_t z[24];
+    bool infinity;
+} __align__(8) jacobian_cgbn_t;
+```
 
 ### Kernel Algorithm
 
@@ -198,6 +245,20 @@ fn main() {
 | Layout validation tests | ✅ 6/6 passing |
 | CGBN kernel tests | ✅ 5/5 passing |
 | BLS12-377 tests | ✅ 13/13 passing (no regressions) |
+
+---
+
+## Priority Alignment (SP1 e2e)
+
+SP1 e2e uses the BLS12-377/BW6-761 cycle. This kernel is ready for BW6 G1 MSM,
+but two high-impact gaps remain outside this file:
+
+1. **BW6 sparse-quotient GPU path** is not implemented yet (top priority in `GPU_plan.md`).
+2. **BW6 G1 MSM dispatch in the lean prover**: `msm_backend::msm_g1` does not route BW6 to GPU today.
+3. **G2 MSM** is still CPU-only (lower priority).
+
+See `GPU_plan.md` for the ordered work list and estimated gains.
+See `docs/GPU_INDEX.md` for the full GPU documentation tree.
 
 ---
 

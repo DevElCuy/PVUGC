@@ -236,6 +236,19 @@ harness = false
 
 ---
 
+## Priority Alignment (Lean e2e)
+
+Lean e2e uses the MNT4-298/MNT6-298 cycle (DefaultCycle). Kernel support exists
+for both curves, but two integration gaps remain:
+
+1. **MNT6 G1 MSM dispatch in the lean prover**: `msm_backend::msm_g1` only routes MNT4 today.
+2. **G2 MSM**: still CPU for MNT6 (no GPU kernel or dispatch).
+
+These items are covered in the ordered list in `GPU_plan.md`.
+See `docs/GPU_INDEX.md` for the full GPU documentation tree.
+
+---
+
 ## Future Optimizations
 
 1. **Pippenger Algorithm**: O(n / log(n)) for large MSMs
