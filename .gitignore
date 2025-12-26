@@ -49,6 +49,7 @@ coverage/
 
 # Performance cache for Groth16 proving/verification keys
 inner_crs_pk_vk.bin
+outer_crs_*.bin
 
 # CUDA debug and test files
 sppark-msm/src/test_field.cu
