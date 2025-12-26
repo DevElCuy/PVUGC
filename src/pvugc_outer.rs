@@ -38,6 +38,24 @@ use sppark_msm::{
 
 type StatementVec<C> = Vec<InnerScalar<C>>;
 
+/// Check if the cycle uses MNT4-298/MNT6-298 curves (for GPU sparse quotient kernel selection).
+#[cfg(feature = "gpu")]
+fn is_mnt_cycle<C: RecursionCycle>() -> bool {
+    use std::any::TypeId;
+    TypeId::of::<C::OuterE>() == TypeId::of::<ark_mnt6_298::MNT6_298>()
+}
+
+/// Precomputed data for GPU sparse quotient computation.
+/// All data is converted to [u32; 10] format (plain form, not Montgomery).
+#[cfg(feature = "gpu")]
+struct GpuQuotientData {
+    col_a_csr: SparseMatrixCsr,
+    col_b_csr: SparseMatrixCsr,
+    domain_elements_u32: Vec<[u32; 10]>,
+    inv_domain_elements_u32: Vec<[u32; 10]>,
+    inv_n_one_minus_omega_u32: Vec<[u32; 10]>,
+}
+
 /// Perform MSM with GPU acceleration when available for BW6-761.
 /// Falls back to CPU for other curves or when GPU is unavailable.
 #[cfg(feature = "gpu")]
@@ -187,16 +205,365 @@ fn scalars_to_u32_array<F: PrimeField>(scalars: &[F]) -> Vec<[u32; 10]> {
 }
 
 /// Convert [u32; 10] array back to scalar field element.
+/// Uses from_le_bytes_mod_order to avoid hardcoding limb count.
 #[cfg(feature = "gpu")]
 fn u32_array_to_scalar<F: PrimeField>(arr: &[u32; 10]) -> F {
-    // Reconstruct u64 limbs from u32 pairs
-    let mut u64_limbs = [0u64; 5];
-    for i in 0..5 {
-        u64_limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+    // Convert u32 array to little-endian bytes
+    let mut bytes = [0u8; 40];
+    for (i, &val) in arr.iter().enumerate() {
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
     }
-    // Create BigInt from limbs and convert to field element
-    // Note: from_bigint expects plain form and converts to Montgomery
-    F::from_bigint(ark_ff::BigInt(u64_limbs)).expect("valid field element")
+    F::from_le_bytes_mod_order(&bytes)
+}
+
+/// Process a batch of pairs using GPU for coefficient computation, then run MSMs.
+///
+/// This function uses the GPU kernel to compute coefficients for all pairs in the batch,
+/// then converts results to MSM tasks and runs them with GPU fallback.
+#[cfg(feature = "gpu")]
+fn compute_quotient_bases_gpu<C: RecursionCycle>(
+    gpu_data: &GpuQuotientData,
+    pairs: &[(usize, usize)],
+    lagrange_srs: &[<C::OuterE as Pairing>::G1Affine],
+    q_vector: &[<C::OuterE as Pairing>::G1Affine],
+    domain_size: usize,
+    max_col_a: usize,
+    max_col_b: usize,
+    progress_counter: &std::sync::atomic::AtomicUsize,
+    total_pairs: usize,
+    wit_start: Instant,
+) -> Vec<(u32, u32, <C::OuterE as Pairing>::G1Affine)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    // Convert pairs to u32 format
+    let pairs_u32: Vec<(u32, u32)> = pairs.iter()
+        .map(|(i, j)| (*i as u32, *j as u32))
+        .collect();
+
+    // Call GPU kernel for coefficient computation
+    let coeff_results = match compute_sparse_quotient_coeffs_mnt4_298_gpu(
+        &gpu_data.col_a_csr,
+        &gpu_data.col_b_csr,
+        &gpu_data.domain_elements_u32,
+        &gpu_data.inv_domain_elements_u32,
+        &gpu_data.inv_n_one_minus_omega_u32,
+        domain_size as u32,
+        &pairs_u32,
+        max_col_a as u32,
+        max_col_b as u32,
+        std::cmp::min(max_col_a, max_col_b) as u32,
+    ) {
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("[GPU Quotient] Kernel failed: {:?}. pairs={}, max_col_a={}, max_col_b={}",
+                     e, pairs.len(), max_col_a, max_col_b);
+            return Vec::new();
+        }
+    };
+
+    // Build MSM tasks from GPU output
+    let msm_tasks: Vec<_> = coeff_results.into_iter()
+        .zip(pairs.iter())
+        .filter_map(|(output, &(i, j))| {
+            let prog = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if prog == 0 || prog % 100000 == 0 {
+                let elapsed = wit_start.elapsed().as_secs_f64();
+                let rate = prog as f64 / elapsed;
+                println!(
+                    "[Quotient GPU] {}/{} ({:.1}%) | {:.0} pair/s",
+                    prog,
+                    total_pairs,
+                    (prog as f64 / total_pairs as f64) * 100.0,
+                    rate
+                );
+            }
+
+            build_msm_task_from_gpu_output::<C>(
+                output, i, j,
+                &gpu_data.col_a_csr, &gpu_data.col_b_csr,
+                lagrange_srs, q_vector
+            )
+        })
+        .collect();
+
+    // Process MSMs in parallel (with GPU acceleration when available)
+    let msm_results: Vec<((u32, u32), <C::OuterE as Pairing>::G1)> = msm_tasks
+        .into_par_iter()
+        .map(|(bases, scalars, pair_id)| {
+            let h_acc = msm_with_gpu_fallback::<C::OuterE>(&bases, &scalars);
+            (pair_id, h_acc)
+        })
+        .filter(|(_, h_acc)| !h_acc.is_zero())
+        .collect();
+
+    // Convert to affine
+    let mut point_accs = Vec::with_capacity(msm_results.len());
+    let mut point_ids = Vec::with_capacity(msm_results.len());
+    for (pair_id, h_acc) in msm_results {
+        point_accs.push(h_acc);
+        point_ids.push(pair_id);
+    }
+
+    let mut affine_results = Vec::with_capacity(point_accs.len());
+    if !point_accs.is_empty() {
+        let affines = <C::OuterE as Pairing>::G1::normalize_batch(&point_accs);
+        for (idx, affine) in affines.into_iter().enumerate() {
+            affine_results.push((point_ids[idx].0, point_ids[idx].1, affine));
+        }
+    }
+
+    affine_results
+}
+
+/// Build an MSM task from GPU output for a single (i,j) pair.
+///
+/// Converts the GPU output coefficients back to field elements and pairs them
+/// with the appropriate Lagrange and Q-vector bases.
+#[cfg(feature = "gpu")]
+fn build_msm_task_from_gpu_output<C: RecursionCycle>(
+    output: SparseQuotientPairOutput,
+    i: usize, j: usize,
+    col_a_csr: &SparseMatrixCsr,
+    col_b_csr: &SparseMatrixCsr,
+    lagrange_srs: &[<C::OuterE as Pairing>::G1Affine],
+    q_vector: &[<C::OuterE as Pairing>::G1Affine],
+) -> Option<(Vec<<C::OuterE as Pairing>::G1Affine>, Vec<OuterScalar<C>>, (u32, u32))> {
+    let mut bases = Vec::new();
+    let mut scalars = Vec::new();
+
+    // Get row indices for this pair from CSR
+    let a_start = col_a_csr.col_ptr[i] as usize;
+    let a_end = col_a_csr.col_ptr[i + 1] as usize;
+    let b_start = col_b_csr.col_ptr[j] as usize;
+    let b_end = col_b_csr.col_ptr[j + 1] as usize;
+
+    // Add off-diagonal contributions from acc_u
+    for (idx, coeff_u32) in output.acc_u.iter().enumerate() {
+        let coeff: OuterScalar<C> = u32_array_to_scalar(coeff_u32);
+        if !coeff.is_zero() {
+            let row_k = col_a_csr.row_idx[a_start + idx] as usize;
+            bases.push(lagrange_srs[row_k]);
+            scalars.push(coeff);
+        }
+    }
+
+    // Add off-diagonal contributions from acc_v
+    for (idx, coeff_u32) in output.acc_v.iter().enumerate() {
+        let coeff: OuterScalar<C> = u32_array_to_scalar(coeff_u32);
+        if !coeff.is_zero() {
+            let row_m = col_b_csr.row_idx[b_start + idx] as usize;
+            bases.push(lagrange_srs[row_m]);
+            scalars.push(coeff);
+        }
+    }
+
+    // Add diagonal contributions from diag_terms
+    // Aggregate by row index first, as in CPU path
+    if !output.diag_terms.is_empty() {
+        let mut sorted_diag: Vec<(u32, [u32; 10])> = output.diag_terms;
+        sorted_diag.sort_unstable_by_key(|(k, _)| *k);
+
+        let mut cur_k = sorted_diag[0].0;
+        let mut cur_acc: OuterScalar<C> = OuterScalar::<C>::zero();
+
+        for (k, val_u32) in sorted_diag.into_iter() {
+            let val: OuterScalar<C> = u32_array_to_scalar(&val_u32);
+            if k != cur_k {
+                if !cur_acc.is_zero() {
+                    bases.push(q_vector[cur_k as usize]);
+                    scalars.push(cur_acc);
+                }
+                cur_k = k;
+                cur_acc = val;
+            } else {
+                cur_acc += val;
+            }
+        }
+        if !cur_acc.is_zero() {
+            bases.push(q_vector[cur_k as usize]);
+            scalars.push(cur_acc);
+        }
+    }
+
+    // Suppress warning about unused variables
+    let _ = (a_end, b_end);
+
+    if bases.is_empty() {
+        None
+    } else {
+        Some((bases, scalars, (i as u32, j as u32)))
+    }
+}
+
+/// CPU path for computing quotient bases (original implementation).
+///
+/// This is the fallback path used when GPU is not available or not applicable.
+fn compute_quotient_bases_cpu<C: RecursionCycle>(
+    sorted_pairs: &[(usize, usize)],
+    col_a: &[Vec<(usize, OuterScalar<C>)>],
+    col_b: &[Vec<(usize, OuterScalar<C>)>],
+    lagrange_srs: &[<C::OuterE as Pairing>::G1Affine],
+    q_vector: &[<C::OuterE as Pairing>::G1Affine],
+    domain_elements: &[OuterScalar<C>],
+    inv_domain_elements: &[OuterScalar<C>],
+    inv_n_one_minus_omega: &[OuterScalar<C>],
+    domain_size: usize,
+    max_col_a: usize,
+    max_col_b: usize,
+    progress_counter: &std::sync::atomic::AtomicUsize,
+    total_pairs: usize,
+    wit_start: Instant,
+) -> Vec<(u32, u32, <C::OuterE as Pairing>::G1Affine)> {
+    const CHUNK_SIZE: usize = 512;
+
+    sorted_pairs
+        .par_chunks(CHUNK_SIZE)
+        .flat_map(|chunk| {
+            let mut acc_u = Vec::with_capacity(max_col_a);
+            let mut acc_v = Vec::with_capacity(max_col_b);
+            // Build MSM tasks per pair, then run them in parallel.
+            let mut msm_tasks: Vec<(
+                Vec<<C::OuterE as Pairing>::G1Affine>,
+                Vec<OuterScalar<C>>,
+                (u32, u32),
+            )> = Vec::with_capacity(chunk.len());
+
+            for &(i, j) in chunk {
+                let prog = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if prog == 0 || prog % 100000 == 0 {
+                    let elapsed = wit_start.elapsed().as_secs_f64();
+                    let rate = prog as f64 / elapsed;
+                    println!(
+                        "[Quotient CPU] {}/{} ({:.1}%) | {:.0} pair/s",
+                        prog,
+                        total_pairs,
+                        (prog as f64 / total_pairs as f64) * 100.0,
+                        rate
+                    );
+                }
+
+                let i_idx = i;
+                let j_idx = j;
+                let rows_u: &Vec<(usize, OuterScalar<C>)> = &col_a[i_idx];
+                let rows_v: &Vec<(usize, OuterScalar<C>)> = &col_b[j_idx];
+
+                if rows_u.is_empty() || rows_v.is_empty() {
+                    continue;
+                }
+
+                let n_u = rows_u.len();
+                let n_v = rows_v.len();
+
+                // Accumulate coefficients
+                acc_u.clear();
+                acc_u.resize(n_u, OuterScalar::<C>::zero());
+                acc_v.clear();
+                acc_v.resize(n_v, OuterScalar::<C>::zero());
+
+                // Diagonal terms
+                let mut diag_terms: Vec<(usize, OuterScalar<C>)> = Vec::new();
+                diag_terms.reserve(std::cmp::min(n_u, n_v));
+
+                for (idx_u, &(_, val_u)) in rows_u.iter().enumerate() {
+                    for (idx_v, &(_, val_v)) in rows_v.iter().enumerate() {
+                        let k = rows_u[idx_u].0;
+                        let m = rows_v[idx_v].0;
+
+                        let prod = val_u * val_v;
+
+                        if k == m {
+                            diag_terms.push((k, prod));
+                        } else {
+                            // Off-diagonal term
+                            let wm = domain_elements[m];
+                            let wk = domain_elements[k];
+                            let d = if k >= m { k - m } else { k + domain_size - m };
+                            let inv_denom = -(inv_domain_elements[m] * inv_n_one_minus_omega[d]);
+                            let common = prod * inv_denom;
+                            acc_u[idx_u] += common * wm;
+                            acc_v[idx_v] -= common * wk;
+                        }
+                    }
+                }
+
+                // Collect bases for MSM
+                let mut pair_bases =
+                    Vec::with_capacity(max_col_a + max_col_b + diag_terms.len());
+                let mut pair_scalars =
+                    Vec::with_capacity(max_col_a + max_col_b + diag_terms.len());
+
+                // Add off-diagonal contributions (Lagrange bases)
+                for (idx_u, &(k, _)) in rows_u.iter().enumerate() {
+                    if !acc_u[idx_u].is_zero() {
+                        pair_bases.push(lagrange_srs[k]);
+                        pair_scalars.push(acc_u[idx_u]);
+                    }
+                }
+                for (idx_v, &(m, _)) in rows_v.iter().enumerate() {
+                    if !acc_v[idx_v].is_zero() {
+                        pair_bases.push(lagrange_srs[m]);
+                        pair_scalars.push(acc_v[idx_v]);
+                    }
+                }
+
+                // Add diagonal contributions (Q bases)
+                if !diag_terms.is_empty() {
+                    diag_terms.sort_unstable_by_key(|(k, _)| *k);
+                    let mut cur_k = diag_terms[0].0;
+                    let mut cur_acc = OuterScalar::<C>::zero();
+                    for (k, s) in diag_terms.into_iter() {
+                        if k != cur_k {
+                            if !cur_acc.is_zero() {
+                                pair_bases.push(q_vector[cur_k]);
+                                pair_scalars.push(cur_acc);
+                            }
+                            cur_k = k;
+                            cur_acc = s;
+                        } else {
+                            cur_acc += s;
+                        }
+                    }
+                    if !cur_acc.is_zero() {
+                        pair_bases.push(q_vector[cur_k]);
+                        pair_scalars.push(cur_acc);
+                    }
+                }
+
+                if !pair_bases.is_empty() {
+                    msm_tasks.push((pair_bases, pair_scalars, (i as u32, j as u32)));
+                }
+            }
+
+            // Process MSMs in parallel
+            let msm_results: Vec<((u32, u32), <C::OuterE as Pairing>::G1)> = msm_tasks
+                .into_par_iter()
+                .map(|(bases, scalars, pair_id)| {
+                    let h_acc = msm_with_gpu_fallback::<C::OuterE>(&bases, &scalars);
+                    (pair_id, h_acc)
+                })
+                .filter(|(_, h_acc)| !h_acc.is_zero())
+                .collect();
+
+            let mut point_accs = Vec::with_capacity(msm_results.len());
+            let mut point_ids = Vec::with_capacity(msm_results.len());
+            for (pair_id, h_acc) in msm_results {
+                point_accs.push(h_acc);
+                point_ids.push(pair_id);
+            }
+
+            let mut affine_results = Vec::with_capacity(point_accs.len());
+            if !point_accs.is_empty() {
+                let affines = <C::OuterE as Pairing>::G1::normalize_batch(&point_accs);
+                for (idx, affine) in affines.into_iter().enumerate() {
+                    affine_results.push((point_ids[idx].0, point_ids[idx].1, affine));
+                }
+            }
+
+            affine_results
+        })
+        .collect()
 }
 
 /// Build PVUGC VK and Lean PK from the OUTER proving key.
@@ -570,8 +937,8 @@ fn compute_witness_bases<C: RecursionCycle>(
     let max_col_b = col_b.iter().map(|c| c.len()).max().unwrap_or(0);
     let buffer_capacity = std::cmp::max(max_col_a, max_col_b) * 20;
     println!(
-        "[Quotient] Pre-allocating buffers of size {} to avoid churn",
-        buffer_capacity
+        "[Quotient] Pre-allocating buffers of size {} to avoid churn (max_col_a={}, max_col_b={})",
+        buffer_capacity, max_col_a, max_col_b
     );
 
     // --- Diagonal Terms Computation (Optimized via Convolution) ---
@@ -671,164 +1038,140 @@ fn compute_witness_bases<C: RecursionCycle>(
             domain_elements[idx]
         })
         .collect();
+
+    // --- GPU Data Preparation ---
+    // Prepare GPU-compatible data structures for sparse quotient computation.
+    // This is done once before the main loop to avoid repeated conversions.
+    #[cfg(feature = "gpu")]
+    let gpu_data: Option<GpuQuotientData> = if sparse_quotient_gpu_available() && is_mnt_cycle::<C>() {
+        println!("[Quotient] GPU sparse quotient kernel available. Preparing GPU data...");
+        let gpu_prep_start = Instant::now();
+
+        let data = GpuQuotientData {
+            col_a_csr: sparse_columns_to_csr(&col_a),
+            col_b_csr: sparse_columns_to_csr(&col_b),
+            domain_elements_u32: scalars_to_u32_array(&domain_elements),
+            inv_domain_elements_u32: scalars_to_u32_array(&inv_domain_elements),
+            inv_n_one_minus_omega_u32: scalars_to_u32_array(&inv_n_one_minus_omega),
+        };
+
+        println!(
+            "[Quotient] GPU data prepared in {:?}. CSR A: {} cols, {} nnz. CSR B: {} cols, {} nnz",
+            gpu_prep_start.elapsed(),
+            data.col_a_csr.col_ptr.len() - 1,
+            data.col_a_csr.values.len(),
+            data.col_b_csr.col_ptr.len() - 1,
+            data.col_b_csr.values.len()
+        );
+
+        Some(data)
+    } else {
+        #[cfg(feature = "gpu")]
+        {
+            if !sparse_quotient_gpu_available() {
+                println!("[Quotient] GPU sparse quotient kernel not available. Using CPU path.");
+            } else if !is_mnt_cycle::<C>() {
+                println!("[Quotient] Not MNT cycle. Using CPU path.");
+            }
+        }
+        None
+    };
+
+    #[cfg(not(feature = "gpu"))]
+    let gpu_data: Option<()> = None;
+
     let total_pairs = sorted_pairs.len();
     let progress_counter = std::sync::atomic::AtomicUsize::new(0);
 
-    // Chunk size for batching
-    const CHUNK_SIZE: usize = 512;
+    // GPU batch size - dynamically computed based on available memory
+    // Each pair needs: max_col_a*40 + max_col_b*40 + max_diag*4 + max_diag*40 bytes
+    // We target using at most 500MB for output buffers since we also need input data
+    // and Rayon may run multiple batches in parallel
+    #[cfg(feature = "gpu")]
+    let gpu_batch_size = {
+        let max_diag = std::cmp::min(max_col_a, max_col_b);
+        let bytes_per_pair = (max_col_a * 40) + (max_col_b * 40) + (max_diag * 4) + (max_diag * 40);
+        let target_memory_bytes = 500_000_000usize; // 500MB to be safe
+        let computed_batch = if bytes_per_pair > 0 {
+            target_memory_bytes / bytes_per_pair
+        } else {
+            10000
+        };
+        let batch_size = computed_batch.clamp(100, 10000);
+        println!("[Quotient] GPU batch size: {} ({}MB per batch, {} bytes/pair)",
+                 batch_size,
+                 (batch_size * bytes_per_pair) / (1024 * 1024),
+                 bytes_per_pair);
+        batch_size
+    };
+    #[cfg(not(feature = "gpu"))]
+    let _gpu_batch_size = 10000usize;
 
-    let h_wit: Vec<_> = sorted_pairs
-        .par_chunks(CHUNK_SIZE)
-        .flat_map(|chunk| {
-            let mut acc_u = Vec::with_capacity(max_col_a);
-            let mut acc_v = Vec::with_capacity(max_col_b);
-            // Build MSM tasks per pair, then run them in parallel. This preserves high throughput
-            // on many-core machines (nested parallelism can help here).
-            let mut msm_tasks: Vec<(
-                Vec<<C::OuterE as Pairing>::G1Affine>,
-                Vec<OuterScalar<C>>,
-                (u32, u32),
-            )> = Vec::with_capacity(chunk.len());
+    // --- Main Pair Loop ---
+    // Use GPU path if available, otherwise fall back to CPU
+    #[cfg(feature = "gpu")]
+    let h_wit: Vec<_> = if let Some(ref gpu_data) = gpu_data {
+        // GPU PATH: Process in sequential batches (GPU memory is shared, so serialize GPU calls)
+        // MSM operations within each batch are still parallelized
+        println!("[Quotient] Using GPU path for coefficient computation...");
+        sorted_pairs
+            .chunks(gpu_batch_size)
+            .flat_map(|chunk| {
+                compute_quotient_bases_gpu::<C>(
+                    gpu_data,
+                    chunk,
+                    &lagrange_srs,
+                    &q_vector,
+                    domain_size,
+                    max_col_a,
+                    max_col_b,
+                    &progress_counter,
+                    total_pairs,
+                    wit_start,
+                )
+            })
+            .collect()
+    } else {
+        // CPU PATH: Use existing chunked parallel code
+        compute_quotient_bases_cpu::<C>(
+            &sorted_pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+            max_col_a,
+            max_col_b,
+            &progress_counter,
+            total_pairs,
+            wit_start,
+        )
+    };
 
-            for &(i, j) in chunk {
-                let prog = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if prog == 0 || prog % 100000 == 0 {
-                    let elapsed = wit_start.elapsed().as_secs_f64();
-                    let rate = prog as f64 / elapsed;
-                    println!(
-                        "[Quotient] {}/{} ({:.1}%) | {:.0} pair/s",
-                        prog,
-                        total_pairs,
-                        (prog as f64 / total_pairs as f64) * 100.0,
-                        rate
-                    );
-                }
+    #[cfg(not(feature = "gpu"))]
+    let h_wit: Vec<_> = {
+        let _ = gpu_data; // suppress warning
+        compute_quotient_bases_cpu::<C>(
+            &sorted_pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+            max_col_a,
+            max_col_b,
+            &progress_counter,
+            total_pairs,
+            wit_start,
+        )
+    };
 
-                let i_idx = i as usize;
-                let j_idx = j as usize;
-                let rows_u: &Vec<(usize, OuterScalar<C>)> = &col_a[i_idx];
-                let rows_v: &Vec<(usize, OuterScalar<C>)> = &col_b[j_idx];
-
-                if rows_u.is_empty() || rows_v.is_empty() {
-                    continue;
-                }
-
-                let n_u = rows_u.len();
-                let n_v = rows_v.len();
-
-                // 1. Accumulate coefficients
-                acc_u.clear();
-                acc_u.resize(n_u, OuterScalar::<C>::zero());
-                acc_v.clear();
-                acc_v.resize(n_v, OuterScalar::<C>::zero());
-
-                // Extra bases for diagonal contributions (using q_vector)
-                // We may encounter multiple diagonal hits (k==m) per (i,j). Aggregate them by k so each
-                // q_vector[k] appears at most once in the MSM (reduces MSM size noticeably for dense overlaps).
-                let mut diag_terms: Vec<(usize, OuterScalar<C>)> = Vec::new();
-                diag_terms.reserve(std::cmp::min(n_u, n_v));
-
-                for (idx_u, &(_, val_u)) in rows_u.iter().enumerate() {
-                    for (idx_v, &(_, val_v)) in rows_v.iter().enumerate() {
-                        let k = rows_u[idx_u].0;
-                        let m = rows_v[idx_v].0;
-
-                        let prod = val_u * val_v;
-
-                        if k == m {
-                            // Diagonal term: prod * Q[k]
-                            diag_terms.push((k, prod));
-                        } else {
-                            // Off-diagonal term
-                            let wm = domain_elements[m];
-                            let wk = domain_elements[k];
-                            // inv(n*(wk-wm)) = -ω^{-m} * inv_n_one_minus_omega[(k-m) mod n]
-                            let d = if k >= m { k - m } else { k + domain_size - m };
-                            // inv_n_one_minus_omega[0] is special and not used here because k != m ⇒ d != 0.
-                            let inv_denom = -(inv_domain_elements[m] * inv_n_one_minus_omega[d]);
-                            let common = prod * inv_denom;
-                            acc_u[idx_u] += common * wm;
-                            acc_v[idx_v] -= common * wk;
-                        }
-                    }
-                }
-
-                // 3. Collect bases for MSM
-                let mut pair_bases =
-                    Vec::with_capacity(max_col_a + max_col_b + diag_terms.len());
-                let mut pair_scalars =
-                    Vec::with_capacity(max_col_a + max_col_b + diag_terms.len());
-
-                // Add off-diagonal contributions (Lagrange bases)
-                for (idx_u, &(k, _)) in rows_u.iter().enumerate() {
-                    if !acc_u[idx_u].is_zero() {
-                        pair_bases.push(lagrange_srs[k]);
-                        pair_scalars.push(acc_u[idx_u]);
-                    }
-                }
-                for (idx_v, &(m, _)) in rows_v.iter().enumerate() {
-                    if !acc_v[idx_v].is_zero() {
-                        pair_bases.push(lagrange_srs[m]);
-                        pair_scalars.push(acc_v[idx_v]);
-                    }
-                }
-
-                // Add diagonal contributions (Q bases)
-                if !diag_terms.is_empty() {
-                    diag_terms.sort_unstable_by_key(|(k, _)| *k);
-                    let mut cur_k = diag_terms[0].0;
-                    let mut cur_acc = OuterScalar::<C>::zero();
-                    for (k, s) in diag_terms.into_iter() {
-                        if k != cur_k {
-                            if !cur_acc.is_zero() {
-                                pair_bases.push(q_vector[cur_k]);
-                                pair_scalars.push(cur_acc);
-                            }
-                            cur_k = k;
-                            cur_acc = s;
-                        } else {
-                            cur_acc += s;
-                        }
-                    }
-                    if !cur_acc.is_zero() {
-                        pair_bases.push(q_vector[cur_k]);
-                        pair_scalars.push(cur_acc);
-                    }
-                }
-
-                if !pair_bases.is_empty() {
-                    msm_tasks.push((pair_bases, pair_scalars, (i as u32, j as u32)));
-                }
-            }
-
-            // Process MSMs in parallel (with GPU acceleration for BW6-761 when available)
-            let msm_results: Vec<((u32, u32), <C::OuterE as Pairing>::G1)> = msm_tasks
-                .into_par_iter()
-                .map(|(bases, scalars, pair_id)| {
-                    let h_acc = msm_with_gpu_fallback::<C::OuterE>(&bases, &scalars);
-                    (pair_id, h_acc)
-                })
-                .filter(|(_, h_acc)| !h_acc.is_zero())
-                .collect();
-
-            let mut point_accs = Vec::with_capacity(msm_results.len());
-            let mut point_ids = Vec::with_capacity(msm_results.len());
-            for (pair_id, h_acc) in msm_results {
-                point_accs.push(h_acc);
-                point_ids.push(pair_id);
-            }
-
-            let mut affine_results = Vec::with_capacity(point_accs.len());
-            if !point_accs.is_empty() {
-                let affines = <C::OuterE as Pairing>::G1::normalize_batch(&point_accs);
-                for (idx, affine) in affines.into_iter().enumerate() {
-                    affine_results.push((point_ids[idx].0, point_ids[idx].1, affine));
-                }
-            }
-
-            affine_results
-        })
-        .collect();
     let count = h_wit.len();
     println!(
         "[Quotient] Witness Bases done. Found {} non-zero bases. Time: {:?}",
@@ -1333,4 +1676,671 @@ pub fn arm_columns_outer_for<C: RecursionCycle>(
     rho: &OuterScalar<C>,
 ) -> ColumnArms<C::OuterE> {
     crate::arming::arm_columns(bases, rho).expect("arm_columns failed")
+}
+
+// ============================================================================
+// Integration Tests: GPU vs CPU Path Consistency
+// ============================================================================
+
+#[cfg(all(test, feature = "gpu"))]
+mod sparse_quotient_integration_tests {
+    use super::*;
+    use ark_ff::{FftField, UniformRand};
+    use ark_mnt4_298::Fr as MNT4Fr;
+    use ark_std::rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+
+    /// Convert an arkworks Fr element to u32[10] limbs (little-endian)
+    fn fr_to_limbs(f: &MNT4Fr) -> [u32; 10] {
+        let bigint: ark_ff::BigInt<5> = f.into_bigint();
+        let mut limbs = [0u32; 10];
+        for (i, &limb64) in bigint.0.iter().enumerate() {
+            limbs[2 * i] = limb64 as u32;
+            limbs[2 * i + 1] = (limb64 >> 32) as u32;
+        }
+        limbs
+    }
+
+    /// Build a simple evaluation domain and precompute domain tables.
+    /// Returns (domain_elements, inv_domain_elements, inv_n_one_minus_omega)
+    fn build_domain_tables(domain_size: usize) -> (Vec<MNT4Fr>, Vec<MNT4Fr>, Vec<MNT4Fr>) {
+        let omega = MNT4Fr::get_root_of_unity(domain_size as u64)
+            .expect("Domain size must be power of 2");
+        let n_field = MNT4Fr::from(domain_size as u64);
+
+        // domain_elements[k] = ω^k
+        let mut domain_elements = Vec::with_capacity(domain_size);
+        let mut current = MNT4Fr::one();
+        for _ in 0..domain_size {
+            domain_elements.push(current);
+            current *= omega;
+        }
+
+        // inv_domain_elements[k] = ω^{-k} = ω^{n-k}
+        let mut inv_domain_elements = vec![MNT4Fr::one(); domain_size];
+        for i in 1..domain_size {
+            inv_domain_elements[i] = domain_elements[domain_size - i];
+        }
+
+        // inv_n_one_minus_omega[d] = 1/(n * (1 - ω^d))
+        let mut inv_n_one_minus_omega = vec![MNT4Fr::zero(); domain_size];
+        let mut denoms = Vec::with_capacity(domain_size - 1);
+        let mut indices = Vec::with_capacity(domain_size - 1);
+
+        for d in 1..domain_size {
+            let denom = n_field * (MNT4Fr::one() - domain_elements[d]);
+            denoms.push(denom);
+            indices.push(d);
+        }
+
+        ark_ff::batch_inversion(&mut denoms);
+        for (i, &d) in indices.iter().enumerate() {
+            inv_n_one_minus_omega[d] = denoms[i];
+        }
+
+        (domain_elements, inv_domain_elements, inv_n_one_minus_omega)
+    }
+
+    /// Generate random G1 points for testing (using MNT6-298 G1)
+    fn random_g1_points(rng: &mut StdRng, count: usize) -> Vec<ark_mnt6_298::G1Affine> {
+        (0..count)
+            .map(|_| ark_mnt6_298::G1Projective::rand(rng).into())
+            .collect()
+    }
+
+    /// CPU path for computing quotient bases (matches the main implementation)
+    fn compute_cpu_h_bases(
+        pairs: &[(usize, usize)],
+        col_a: &[Vec<(usize, MNT4Fr)>],
+        col_b: &[Vec<(usize, MNT4Fr)>],
+        lagrange_srs: &[ark_mnt6_298::G1Affine],
+        q_vector: &[ark_mnt6_298::G1Affine],
+        domain_elements: &[MNT4Fr],
+        inv_domain_elements: &[MNT4Fr],
+        inv_n_one_minus_omega: &[MNT4Fr],
+        domain_size: usize,
+    ) -> Vec<(u32, u32, ark_mnt6_298::G1Affine)> {
+        let mut results = Vec::new();
+
+        for &(i, j) in pairs {
+            let rows_u = &col_a[i];
+            let rows_v = &col_b[j];
+
+            if rows_u.is_empty() || rows_v.is_empty() {
+                continue;
+            }
+
+            let n_u = rows_u.len();
+            let n_v = rows_v.len();
+
+            let mut acc_u = vec![MNT4Fr::zero(); n_u];
+            let mut acc_v = vec![MNT4Fr::zero(); n_v];
+            let mut diag_terms: Vec<(usize, MNT4Fr)> = Vec::new();
+
+            for (idx_u, &(k, val_u)) in rows_u.iter().enumerate() {
+                for (idx_v, &(m, val_v)) in rows_v.iter().enumerate() {
+                    let prod = val_u * val_v;
+
+                    if k == m {
+                        diag_terms.push((k, prod));
+                    } else {
+                        let wm = domain_elements[m];
+                        let wk = domain_elements[k];
+                        let d = if k >= m { k - m } else { k + domain_size - m };
+                        let inv_denom = -(inv_domain_elements[m] * inv_n_one_minus_omega[d]);
+                        let common = prod * inv_denom;
+                        acc_u[idx_u] += common * wm;
+                        acc_v[idx_v] -= common * wk;
+                    }
+                }
+            }
+
+            // Build MSM
+            let mut pair_bases: Vec<ark_mnt6_298::G1Affine> = Vec::new();
+            let mut pair_scalars: Vec<MNT4Fr> = Vec::new();
+
+            for (idx_u, &(k, _)) in rows_u.iter().enumerate() {
+                if !acc_u[idx_u].is_zero() {
+                    pair_bases.push(lagrange_srs[k]);
+                    pair_scalars.push(acc_u[idx_u]);
+                }
+            }
+            for (idx_v, &(m, _)) in rows_v.iter().enumerate() {
+                if !acc_v[idx_v].is_zero() {
+                    pair_bases.push(lagrange_srs[m]);
+                    pair_scalars.push(acc_v[idx_v]);
+                }
+            }
+
+            // Aggregate diagonal terms
+            if !diag_terms.is_empty() {
+                diag_terms.sort_unstable_by_key(|(k, _)| *k);
+                let mut cur_k = diag_terms[0].0;
+                let mut cur_acc = MNT4Fr::zero();
+                for (k, s) in diag_terms.into_iter() {
+                    if k != cur_k {
+                        if !cur_acc.is_zero() {
+                            pair_bases.push(q_vector[cur_k]);
+                            pair_scalars.push(cur_acc);
+                        }
+                        cur_k = k;
+                        cur_acc = s;
+                    } else {
+                        cur_acc += s;
+                    }
+                }
+                if !cur_acc.is_zero() {
+                    pair_bases.push(q_vector[cur_k]);
+                    pair_scalars.push(cur_acc);
+                }
+            }
+
+            if !pair_bases.is_empty() {
+                // Convert scalars to BigInt for MSM
+                let scalars_bigint: Vec<_> = pair_scalars.iter().map(|s| s.into_bigint()).collect();
+                let h_acc = <ark_mnt6_298::G1Projective as ark_ec::VariableBaseMSM>::msm_bigint(
+                    &pair_bases,
+                    &scalars_bigint,
+                );
+                if !h_acc.is_zero() {
+                    results.push((i as u32, j as u32, h_acc.into_affine()));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// GPU path for computing quotient bases (uses GPU kernel + MSM)
+    fn compute_gpu_h_bases(
+        pairs: &[(usize, usize)],
+        col_a: &[Vec<(usize, MNT4Fr)>],
+        col_b: &[Vec<(usize, MNT4Fr)>],
+        lagrange_srs: &[ark_mnt6_298::G1Affine],
+        q_vector: &[ark_mnt6_298::G1Affine],
+        domain_elements: &[MNT4Fr],
+        inv_domain_elements: &[MNT4Fr],
+        inv_n_one_minus_omega: &[MNT4Fr],
+        domain_size: usize,
+    ) -> Vec<(u32, u32, ark_mnt6_298::G1Affine)> {
+        use sppark_msm::compute_sparse_quotient_coeffs_mnt4_298_gpu;
+
+        // Build CSR matrices
+        let col_a_csr = sparse_columns_to_csr_test(col_a);
+        let col_b_csr = sparse_columns_to_csr_test(col_b);
+
+        // Convert domain tables to u32 limbs
+        let domain_limbs: Vec<_> = domain_elements.iter().map(fr_to_limbs).collect();
+        let inv_domain_limbs: Vec<_> = inv_domain_elements.iter().map(fr_to_limbs).collect();
+        let inv_n_limbs: Vec<_> = inv_n_one_minus_omega.iter().map(fr_to_limbs).collect();
+
+        let max_col_a = col_a.iter().map(|c| c.len()).max().unwrap_or(1) as u32;
+        let max_col_b = col_b.iter().map(|c| c.len()).max().unwrap_or(1) as u32;
+        let max_diag = std::cmp::min(max_col_a, max_col_b);
+
+        let pairs_u32: Vec<(u32, u32)> = pairs.iter().map(|(i, j)| (*i as u32, *j as u32)).collect();
+
+        let coeff_results = compute_sparse_quotient_coeffs_mnt4_298_gpu(
+            &col_a_csr,
+            &col_b_csr,
+            &domain_limbs,
+            &inv_domain_limbs,
+            &inv_n_limbs,
+            domain_size as u32,
+            &pairs_u32,
+            max_col_a,
+            max_col_b,
+            max_diag,
+        )
+        .expect("GPU kernel failed");
+
+        // Build MSM tasks from GPU output
+        let mut results = Vec::new();
+
+        for (output, &(i, j)) in coeff_results.iter().zip(pairs.iter()) {
+            let mut pair_bases: Vec<ark_mnt6_298::G1Affine> = Vec::new();
+            let mut pair_scalars: Vec<MNT4Fr> = Vec::new();
+
+            // Get row indices for this pair from CSR
+            let a_start = col_a_csr.col_ptr[i] as usize;
+            let b_start = col_b_csr.col_ptr[j] as usize;
+
+            // Add off-diagonal contributions from acc_u
+            for (idx, coeff_u32) in output.acc_u.iter().enumerate() {
+                let coeff = limbs_to_fr_test(coeff_u32);
+                if !coeff.is_zero() {
+                    let row_k = col_a_csr.row_idx[a_start + idx] as usize;
+                    pair_bases.push(lagrange_srs[row_k]);
+                    pair_scalars.push(coeff);
+                }
+            }
+
+            // Add off-diagonal contributions from acc_v
+            for (idx, coeff_u32) in output.acc_v.iter().enumerate() {
+                let coeff = limbs_to_fr_test(coeff_u32);
+                if !coeff.is_zero() {
+                    let row_m = col_b_csr.row_idx[b_start + idx] as usize;
+                    pair_bases.push(lagrange_srs[row_m]);
+                    pair_scalars.push(coeff);
+                }
+            }
+
+            // Add diagonal contributions
+            if !output.diag_terms.is_empty() {
+                let mut sorted_diag: Vec<_> = output.diag_terms.clone();
+                sorted_diag.sort_unstable_by_key(|(k, _)| *k);
+
+                let mut cur_k = sorted_diag[0].0;
+                let mut cur_acc = MNT4Fr::zero();
+
+                for (k, val_u32) in sorted_diag.into_iter() {
+                    let val = limbs_to_fr_test(&val_u32);
+                    if k != cur_k {
+                        if !cur_acc.is_zero() {
+                            pair_bases.push(q_vector[cur_k as usize]);
+                            pair_scalars.push(cur_acc);
+                        }
+                        cur_k = k;
+                        cur_acc = val;
+                    } else {
+                        cur_acc += val;
+                    }
+                }
+                if !cur_acc.is_zero() {
+                    pair_bases.push(q_vector[cur_k as usize]);
+                    pair_scalars.push(cur_acc);
+                }
+            }
+
+            if !pair_bases.is_empty() {
+                let scalars_bigint: Vec<_> = pair_scalars.iter().map(|s| s.into_bigint()).collect();
+                let h_acc = <ark_mnt6_298::G1Projective as ark_ec::VariableBaseMSM>::msm_bigint(
+                    &pair_bases,
+                    &scalars_bigint,
+                );
+                if !h_acc.is_zero() {
+                    results.push((i as u32, j as u32, h_acc.into_affine()));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Build CSR matrix from sparse columns (test version with concrete type)
+    fn sparse_columns_to_csr_test(cols: &[Vec<(usize, MNT4Fr)>]) -> sppark_msm::SparseMatrixCsr {
+        let num_cols = cols.len();
+        let mut col_ptr = Vec::with_capacity(num_cols + 1);
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+
+        col_ptr.push(0u32);
+        for col in cols {
+            for &(row, val) in col {
+                row_idx.push(row as u32);
+                values.push(fr_to_limbs(&val));
+            }
+            col_ptr.push(values.len() as u32);
+        }
+
+        sppark_msm::SparseMatrixCsr {
+            col_ptr,
+            row_idx,
+            values,
+        }
+    }
+
+    /// Convert u32[10] limbs back to arkworks Fr
+    fn limbs_to_fr_test(limbs: &[u32; 10]) -> MNT4Fr {
+        let mut bigint_limbs = [0u64; 5];
+        for i in 0..5 {
+            bigint_limbs[i] = (limbs[2 * i] as u64) | ((limbs[2 * i + 1] as u64) << 32);
+        }
+        MNT4Fr::from_bigint(ark_ff::BigInt(bigint_limbs)).unwrap_or(MNT4Fr::zero())
+    }
+
+    /// Test: GPU and CPU paths produce identical H_ij bases for synthetic sparse data.
+    ///
+    /// This is the main integration test that verifies:
+    /// 1. Both paths produce the same number of non-zero H_ij bases
+    /// 2. For each (i,j) pair, the resulting G1Affine point is identical
+    /// 3. Results are deterministic
+    #[test]
+    fn test_sparse_quotient_gpu_cpu_consistency() {
+        if !sppark_msm::sparse_quotient_gpu_available() {
+            println!("GPU sparse quotient kernel not available, skipping test");
+            return;
+        }
+
+        let mut rng = StdRng::seed_from_u64(12345);
+        let domain_size = 64usize;
+        let (domain_elements, inv_domain_elements, inv_n_one_minus_omega) =
+            build_domain_tables(domain_size);
+
+        // Generate random sparse columns
+        let num_cols_a = 6;
+        let num_cols_b = 5;
+        let max_nnz_per_col = 8;
+
+        let col_a: Vec<Vec<(usize, MNT4Fr)>> = (0..num_cols_a)
+            .map(|_| {
+                let nnz = rng.gen_range(1..=max_nnz_per_col);
+                let mut rows: Vec<usize> = (0..domain_size).collect();
+                rows.shuffle(&mut rng);
+                rows.truncate(nnz);
+                rows.sort();
+                rows.iter()
+                    .map(|&r| (r, MNT4Fr::rand(&mut rng)))
+                    .collect()
+            })
+            .collect();
+
+        let col_b: Vec<Vec<(usize, MNT4Fr)>> = (0..num_cols_b)
+            .map(|_| {
+                let nnz = rng.gen_range(1..=max_nnz_per_col);
+                let mut rows: Vec<usize> = (0..domain_size).collect();
+                rows.shuffle(&mut rng);
+                rows.truncate(nnz);
+                rows.sort();
+                rows.iter()
+                    .map(|&r| (r, MNT4Fr::rand(&mut rng)))
+                    .collect()
+            })
+            .collect();
+
+        // Generate random G1 points for Lagrange SRS and Q-vector
+        let lagrange_srs = random_g1_points(&mut rng, domain_size);
+        let q_vector = random_g1_points(&mut rng, domain_size);
+
+        // Generate test pairs (all combinations for complete coverage)
+        let pairs: Vec<(usize, usize)> = (0..num_cols_a)
+            .flat_map(|i| (0..num_cols_b).map(move |j| (i, j)))
+            .collect();
+
+        println!("Testing {} pairs with domain_size={}", pairs.len(), domain_size);
+
+        // Compute using CPU path
+        let cpu_results = compute_cpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        // Compute using GPU path
+        let gpu_results = compute_gpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        // Compare results
+        assert_eq!(
+            cpu_results.len(),
+            gpu_results.len(),
+            "CPU and GPU produced different number of non-zero H_ij bases: CPU={}, GPU={}",
+            cpu_results.len(),
+            gpu_results.len()
+        );
+
+        // Sort results by (i, j) for comparison
+        let mut cpu_sorted = cpu_results.clone();
+        let mut gpu_sorted = gpu_results.clone();
+        cpu_sorted.sort_by_key(|(i, j, _)| (*i, *j));
+        gpu_sorted.sort_by_key(|(i, j, _)| (*i, *j));
+
+        for (cpu_entry, gpu_entry) in cpu_sorted.iter().zip(gpu_sorted.iter()) {
+            assert_eq!(
+                cpu_entry.0, gpu_entry.0,
+                "Column i mismatch: CPU={}, GPU={}",
+                cpu_entry.0, gpu_entry.0
+            );
+            assert_eq!(
+                cpu_entry.1, gpu_entry.1,
+                "Column j mismatch: CPU={}, GPU={}",
+                cpu_entry.1, gpu_entry.1
+            );
+            assert_eq!(
+                cpu_entry.2, gpu_entry.2,
+                "H_ij point mismatch for pair ({}, {}): CPU={:?}, GPU={:?}",
+                cpu_entry.0, cpu_entry.1, cpu_entry.2, gpu_entry.2
+            );
+        }
+
+        println!(
+            "PASSED: {} non-zero H_ij bases match between CPU and GPU paths",
+            cpu_results.len()
+        );
+    }
+
+    /// Test: Deterministic results across multiple GPU invocations.
+    #[test]
+    fn test_sparse_quotient_gpu_determinism() {
+        if !sppark_msm::sparse_quotient_gpu_available() {
+            println!("GPU sparse quotient kernel not available, skipping test");
+            return;
+        }
+
+        let mut rng = StdRng::seed_from_u64(54321);
+        let domain_size = 32usize;
+        let (domain_elements, inv_domain_elements, inv_n_one_minus_omega) =
+            build_domain_tables(domain_size);
+
+        // Fixed test data
+        let col_a: Vec<Vec<(usize, MNT4Fr)>> = vec![
+            vec![(1, MNT4Fr::from(100u64)), (5, MNT4Fr::from(200u64))],
+            vec![(3, MNT4Fr::from(300u64)), (7, MNT4Fr::from(400u64)), (10, MNT4Fr::from(500u64))],
+        ];
+        let col_b: Vec<Vec<(usize, MNT4Fr)>> = vec![
+            vec![(1, MNT4Fr::from(50u64)), (8, MNT4Fr::from(150u64))],
+            vec![(5, MNT4Fr::from(250u64))],
+        ];
+
+        let lagrange_srs = random_g1_points(&mut rng, domain_size);
+        let q_vector = random_g1_points(&mut rng, domain_size);
+
+        let pairs = vec![(0, 0), (0, 1), (1, 0), (1, 1)];
+
+        // Run multiple times and verify identical results
+        let first_results = compute_gpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        for run in 1..3 {
+            let results = compute_gpu_h_bases(
+                &pairs,
+                &col_a,
+                &col_b,
+                &lagrange_srs,
+                &q_vector,
+                &domain_elements,
+                &inv_domain_elements,
+                &inv_n_one_minus_omega,
+                domain_size,
+            );
+
+            assert_eq!(
+                first_results.len(),
+                results.len(),
+                "Run {} produced different count",
+                run
+            );
+
+            for (first, curr) in first_results.iter().zip(results.iter()) {
+                assert_eq!(
+                    first, curr,
+                    "Run {} produced different result for pair ({}, {})",
+                    run, first.0, first.1
+                );
+            }
+        }
+
+        println!("PASSED: GPU results are deterministic across 3 runs");
+    }
+
+    /// Test: Empty columns produce empty results.
+    #[test]
+    fn test_sparse_quotient_empty_columns() {
+        if !sppark_msm::sparse_quotient_gpu_available() {
+            println!("GPU sparse quotient kernel not available, skipping test");
+            return;
+        }
+
+        let mut rng = StdRng::seed_from_u64(99999);
+        let domain_size = 16usize;
+        let (domain_elements, inv_domain_elements, inv_n_one_minus_omega) =
+            build_domain_tables(domain_size);
+
+        // Empty columns
+        let col_a: Vec<Vec<(usize, MNT4Fr)>> = vec![vec![], vec![(2, MNT4Fr::from(1u64))]];
+        let col_b: Vec<Vec<(usize, MNT4Fr)>> = vec![vec![(3, MNT4Fr::from(1u64))], vec![]];
+
+        let lagrange_srs = random_g1_points(&mut rng, domain_size);
+        let q_vector = random_g1_points(&mut rng, domain_size);
+
+        // Pair (0, 0) has empty col_a[0], pair (1, 1) has empty col_b[1]
+        let pairs = vec![(0, 0), (0, 1), (1, 0), (1, 1)];
+
+        let cpu_results = compute_cpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        let gpu_results = compute_gpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        // Only pair (1, 0) should produce non-zero result (non-empty columns)
+        assert_eq!(
+            cpu_results.len(),
+            gpu_results.len(),
+            "Empty column handling differs"
+        );
+
+        for (cpu, gpu) in cpu_results.iter().zip(gpu_results.iter()) {
+            assert_eq!(cpu, gpu, "Empty column test mismatch");
+        }
+
+        println!("PASSED: Empty column handling matches between CPU and GPU");
+    }
+
+    /// Test: Large sparse columns with many combinations.
+    #[test]
+    fn test_sparse_quotient_large_columns() {
+        if !sppark_msm::sparse_quotient_gpu_available() {
+            println!("GPU sparse quotient kernel not available, skipping test");
+            return;
+        }
+
+        let mut rng = StdRng::seed_from_u64(77777);
+        let domain_size = 128usize;
+        let (domain_elements, inv_domain_elements, inv_n_one_minus_omega) =
+            build_domain_tables(domain_size);
+
+        // Create columns with many entries (stress test)
+        let nnz_a = 20;
+        let nnz_b = 16;
+
+        let mut rows_a: Vec<usize> = (0..domain_size).collect();
+        rows_a.shuffle(&mut rng);
+        rows_a.truncate(nnz_a);
+        rows_a.sort();
+
+        let mut rows_b: Vec<usize> = (0..domain_size).collect();
+        rows_b.shuffle(&mut rng);
+        rows_b.truncate(nnz_b);
+        rows_b.sort();
+
+        let col_a: Vec<Vec<(usize, MNT4Fr)>> = vec![rows_a
+            .iter()
+            .map(|&r| (r, MNT4Fr::rand(&mut rng)))
+            .collect()];
+        let col_b: Vec<Vec<(usize, MNT4Fr)>> = vec![rows_b
+            .iter()
+            .map(|&r| (r, MNT4Fr::rand(&mut rng)))
+            .collect()];
+
+        let lagrange_srs = random_g1_points(&mut rng, domain_size);
+        let q_vector = random_g1_points(&mut rng, domain_size);
+
+        let pairs = vec![(0, 0)];
+
+        let cpu_results = compute_cpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        let gpu_results = compute_gpu_h_bases(
+            &pairs,
+            &col_a,
+            &col_b,
+            &lagrange_srs,
+            &q_vector,
+            &domain_elements,
+            &inv_domain_elements,
+            &inv_n_one_minus_omega,
+            domain_size,
+        );
+
+        assert_eq!(
+            cpu_results.len(),
+            gpu_results.len(),
+            "Large column test: different result counts"
+        );
+
+        for (cpu, gpu) in cpu_results.iter().zip(gpu_results.iter()) {
+            assert_eq!(
+                cpu, gpu,
+                "Large column test mismatch for pair ({}, {})",
+                cpu.0, cpu.1
+            );
+        }
+
+        println!(
+            "PASSED: Large columns ({}x{}={} combinations) match",
+            nnz_a,
+            nnz_b,
+            nnz_a * nnz_b
+        );
+    }
 }
