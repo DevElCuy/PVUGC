@@ -5,6 +5,11 @@
 # Use more parallel jobs
 jobs = 16
 
+# Allow multiple definitions for CGBN error reporting functions
+# These are defined in each CUDA kernel object file and get linked together
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
 [target.x86_64-apple-darwin]
 # Use faster linker on macOS (zld or lld if available)
 # Uncomment if you have zld installed: brew install michaeleisel/zld/zld

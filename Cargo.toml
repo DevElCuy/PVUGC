@@ -78,6 +78,7 @@ opt-level = 3
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+incremental = true
 
 [profile.release.package.ark-groth16]
 incremental = true
