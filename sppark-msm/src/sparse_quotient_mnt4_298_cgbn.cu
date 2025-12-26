@@ -474,6 +474,15 @@ int sparse_quotient_coeffs_mnt4_298_gpu(
     uint32_t threads_per_block = 0;
     uint32_t num_blocks = 0;
 
+    // Pre-calculate allocation sizes for error reporting
+    size_t acc_u_size = (size_t)num_pairs * max_col_a * sizeof(scalar_t);
+    size_t acc_v_size = (size_t)num_pairs * max_col_b * sizeof(scalar_t);
+
+    // Debug: Print allocation sizes
+    fprintf(stderr, "[sparse_quotient MNT4] pairs=%u, max_col_a=%u, max_col_b=%u, acc_u=%.1fMB, acc_v=%.1fMB\n",
+            num_pairs, max_col_a, max_col_b,
+            acc_u_size / (1024.0 * 1024.0), acc_v_size / (1024.0 * 1024.0));
+
     // Allocate device memory for sparse matrices
     uint32_t* d_col_a_ptr;
     uint32_t* d_col_a_idx;
@@ -523,9 +532,13 @@ int sparse_quotient_coeffs_mnt4_298_gpu(
     scalar_t* d_out_diag_val;
     uint32_t* d_out_num_diag;
 
-    err = cudaMalloc(&d_out_acc_u, num_pairs * max_col_a * sizeof(scalar_t));
-    if (err != cudaSuccess) goto cleanup_pairs;
-    err = cudaMalloc(&d_out_acc_v, num_pairs * max_col_b * sizeof(scalar_t));
+    err = cudaMalloc(&d_out_acc_u, acc_u_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[sparse_quotient MNT4] cudaMalloc acc_u failed: %s (requested %.2f MB)\n",
+                cudaGetErrorString(err), acc_u_size / (1024.0 * 1024.0));
+        goto cleanup_pairs;
+    }
+    err = cudaMalloc(&d_out_acc_v, acc_v_size);
     if (err != cudaSuccess) { cudaFree(d_out_acc_u); goto cleanup_pairs; }
     err = cudaMalloc(&d_out_diag_k, num_pairs * max_diag_per_pair * sizeof(uint32_t));
     if (err != cudaSuccess) { cudaFree(d_out_acc_u); cudaFree(d_out_acc_v); goto cleanup_pairs; }
