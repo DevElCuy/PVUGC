@@ -18,13 +18,14 @@
 #define BW6_MSM_ERROR_TIMEOUT -4
 
 // CGBN parameters class (following CGBN sample pattern)
+// Note: TPI=8 is required for 768-bit - CGBN doesn't support TPI=4 at this bit width
 class bw6_cgbn_params_t {
 public:
   static const uint32_t TPB = 0;            // Get TPB from blockDim.x
   static const uint32_t MAX_ROTATION = 4;   // Good default value
   static const uint32_t SHM_LIMIT = 0;      // No shared memory
   static const bool CONSTANT_TIME = false;  // Not available yet
-  static const uint32_t TPI = 8;            // 8 threads cooperate per big number
+  static const uint32_t TPI = 8;            // 8 threads required for 768-bit (CGBN constraint)
   static const uint32_t BITS = 768;         // Round up from 761 bits
 };
 
@@ -37,6 +38,21 @@ __device__ __constant__ uint32_t BW6_761_P_DEVICE[24] = {
     0x25b42304, 0x03cebaff, 0xe584e919, 0x707ba638,
     0x8087be41, 0x528275ef, 0x81d14688, 0xb926186a,
     0x04faff3e, 0xd187c940, 0xfb83ce0a, 0x0122e824
+};
+
+// Montgomery constant: np0 = -P^(-1) mod 2^32
+// Satisfies: np0 * P[0] ≡ 0xFFFFFFFF (mod 2^32)
+__device__ __constant__ uint32_t BW6_761_NP0 = 0x8fa798dd;
+
+// Montgomery R^2 mod P (R = 2^768)
+// Used to convert to Montgomery form: mont(a) = a * R^2 * R^(-1) = a * R mod P
+__device__ __constant__ uint32_t BW6_761_R2_DEVICE[24] = {
+    0x4df6d8b1, 0xdb9852c1, 0x509941e1, 0xb86599b6,
+    0x5610e970, 0xc47e1405, 0xe1d13a44, 0x33d39d1f,
+    0x9b969690, 0xcc9ea946, 0xfe295c21, 0x8f3f2ae1,
+    0x058ed3a0, 0x68c240ca, 0xb46c61a0, 0x64b48c50,
+    0x4f7f1215, 0xcc141c81, 0xb4c48a96, 0x7d1c6c4a,
+    0xb1f31ec3, 0xa1ef5603, 0xa7dd2cf1, 0x0096fcba
 };
 
 // BW6-761 scalar field order (Fr, 377 bits)
@@ -132,25 +148,39 @@ public:
   }
 
   /**
-   * Field multiplication with modular reduction: r = (a * b) mod P
+   * Field multiplication with modular reduction using Montgomery form.
    *
-   * CRITICAL: Must use wide multiplication (cgbn_mul_wide) because:
-   * - a, b are up to 761 bits each
-   * - a * b is up to 1522 bits (doesn't fit in 768-bit bn_t)
-   * - cgbn_mul only keeps the low 768 bits, losing upper bits!
-   * - Must use cgbn_rem_wide to compute (full_product) mod P
+   * Uses CGBN's built-in mont_mul which is highly optimized and doesn't
+   * require wide multiplication (which causes massive code generation).
+   *
+   * IMPORTANT: Inputs must already be in Montgomery form!
+   * mont_mul(aR, bR) = (aR * bR * R^(-1)) mod P = (ab)R mod P
+   *
+   * np0 = -P^(-1) mod 2^32 (Montgomery constant)
    */
   __device__ __forceinline__ void field_mul(bn_t& r, const bn_t& a,
                                              const bn_t& b, const bn_t& P) {
-    // Wide type holds 2*BITS = 1536 bits, enough for 761*2 = 1522 bit product
-    typedef typename env_t::cgbn_wide_t wide_t;
-    wide_t product;
+    cgbn_mont_mul(_env, r, a, b, P, BW6_761_NP0);
+  }
 
-    // Full multiplication: product = a * b (up to 1522 bits)
-    cgbn_mul_wide(_env, product, a, b);
+  /**
+   * Convert a value to Montgomery form: mont(a) = a * R mod P
+   * Done by: mont(a) = mont_mul(a, R^2) = a * R^2 * R^(-1) = a * R
+   */
+  __device__ __forceinline__ void to_montgomery(bn_t& r, const bn_t& a, const bn_t& P) {
+    bn_t R2;
+    cgbn_load(_env, R2, (cgbn_mem_t<params::BITS>*)BW6_761_R2_DEVICE);
+    cgbn_mont_mul(_env, r, a, R2, P, BW6_761_NP0);
+  }
 
-    // Wide remainder: r = product mod P
-    cgbn_rem_wide(_env, r, product, P);
+  /**
+   * Convert from Montgomery form to normal: a = mont(a) * R^(-1) mod P
+   * Done by: mont_mul(aR, 1) = aR * 1 * R^(-1) = a
+   */
+  __device__ __forceinline__ void from_montgomery(bn_t& r, const bn_t& a, const bn_t& P) {
+    bn_t one;
+    cgbn_set_ui32(_env, one, 1);
+    cgbn_mont_mul(_env, r, a, one, P, BW6_761_NP0);
   }
 
   /**
@@ -499,10 +529,13 @@ public:
   }
 
   /**
-   * Convert XYZZ to Jacobian coordinates
+   * Convert XYZZ (in Montgomery form) to Jacobian coordinates (plain form)
    *
    * Normalize to affine by computing x = X/ZZ, y = Y/ZZZ
    * Then output as Jacobian with Z=1: (x, y, 1)
+   *
+   * IMPORTANT: Input coordinates are in Montgomery form.
+   * Output must be in plain form for arkworks compatibility.
    *
    * Uses CGBN modular inverse for division
    */
@@ -515,25 +548,74 @@ public:
     bn_t x_norm, y_norm;
     bn_t zz_inv, zzz_inv;
 
-    // Compute ZZ^(-1) mod P
-    cgbn_modular_inverse(_env, zz_inv, ZZ, P);
+    // Compute ZZ^(-1) mod P (in Montgomery form)
+    // Note: modular_inverse of aR gives (aR)^(-1) = a^(-1) * R^(-1)
+    // To get inverse in Montgomery form, we need: (a^(-1))R
+    // So we compute: inv = modular_inverse(ZZ) then convert to mont
+    // But actually for division: X/ZZ = X * ZZ^(-1)
+    // In Montgomery: (XR) * (ZZ^(-1) in mont) = X/ZZ in Montgomery
+    // Let's think carefully:
+    // We have XR, ZZR. We want (X/ZZ)R = XR * (ZZR)^(-1) * R
+    // modular_inverse(ZZR) = (ZZR)^(-1) = ZZ^(-1) * R^(-1) (plain form!)
+    // So: XR * ZZ^(-1) * R^(-1) * R (if we do mont_mul with R2 after inverse)
+    // = XR * ZZ^(-1) = X/ZZ * R (Montgomery form) -- wrong
+    // Actually: we want plain form output, so:
+    // x_plain = X/ZZ = (XR) * (ZZR)^(-1) in plain
+    // = (XR) * (ZZ^(-1) * R^(-1)) = X * ZZ^(-1) * R * R^(-1) = X * ZZ^(-1) = X/ZZ ✓
+    // So cgbn_modular_inverse on Montgomery values gives plain form inverse!
+    // Then multiplying Montgomery value by plain gives us:
+    // (XR) * (ZZ^(-1)) via mont_mul = XR * ZZ^(-1) * R^(-1) = X * ZZ^(-1) * R * R^(-1) = X/ZZ (plain!)
+    // So we should use regular multiply, not mont_mul for this...
+    // Actually: cgbn_mul + cgbn_rem would overflow. Let's use a different approach.
 
-    // Compute ZZZ^(-1) mod P
-    cgbn_modular_inverse(_env, zzz_inv, ZZZ, P);
+    // Alternative approach: convert to plain first, then divide
+    // X_plain = X / R, ZZ_plain = ZZ / R, then X_plain / ZZ_plain
+    // But this is complex. Let's use the insight that:
+    // If we want x = X/ZZ (in plain), and X,ZZ are in Montgomery:
+    // x_plain = (XR)/(ZZR) = X/ZZ (the R's cancel!)
+    // So we can convert X,ZZ to plain, then do plain division.
 
-    // x = X * ZZ^(-1) mod P
-    field_mul(x_norm, X, zz_inv, P);
+    // Convert from Montgomery to plain
+    bn_t X_plain, Y_plain, ZZ_plain, ZZZ_plain, one;
+    cgbn_set_ui32(_env, one, 1);
+    cgbn_mont_mul(_env, X_plain, X, one, P, BW6_761_NP0);       // X_plain = XR * 1 * R^(-1) = X
+    cgbn_mont_mul(_env, Y_plain, Y, one, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, ZZ_plain, ZZ, one, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, ZZZ_plain, ZZZ, one, P, BW6_761_NP0);
 
-    // y = Y * ZZZ^(-1) mod P
-    field_mul(y_norm, Y, zzz_inv, P);
+    // Compute inverses in plain form
+    cgbn_modular_inverse(_env, zz_inv, ZZ_plain, P);
+    cgbn_modular_inverse(_env, zzz_inv, ZZZ_plain, P);
 
-    // Store normalized affine coordinates
+    // Compute x = X * ZZ^(-1) mod P and y = Y * ZZZ^(-1) mod P
+    // Using Montgomery multiplication: need to convert to mont, multiply, convert back
+    // Or just use modular multiply which doesn't need Montgomery
+    // Actually CGBN has no direct modular multiply without wide...
+    // Let's use Montgomery: convert everything to mont, multiply, convert back
+    bn_t zz_inv_mont, zzz_inv_mont, R2;
+    cgbn_load(_env, R2, (cgbn_mem_t<params::BITS>*)BW6_761_R2_DEVICE);
+    cgbn_mont_mul(_env, zz_inv_mont, zz_inv, R2, P, BW6_761_NP0);    // to Montgomery
+    cgbn_mont_mul(_env, zzz_inv_mont, zzz_inv, R2, P, BW6_761_NP0);
+
+    // Convert X,Y back to Montgomery for multiplication
+    bn_t X_mont, Y_mont;
+    cgbn_mont_mul(_env, X_mont, X_plain, R2, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, Y_mont, Y_plain, R2, P, BW6_761_NP0);
+
+    // Multiply in Montgomery form
+    bn_t x_mont, y_mont;
+    cgbn_mont_mul(_env, x_mont, X_mont, zz_inv_mont, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, y_mont, Y_mont, zzz_inv_mont, P, BW6_761_NP0);
+
+    // Convert result to plain form for output
+    cgbn_mont_mul(_env, x_norm, x_mont, one, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, y_norm, y_mont, one, P, BW6_761_NP0);
+
+    // Store normalized affine coordinates (in plain form)
     cgbn_store(_env, (cgbn_mem_t<params::BITS>*)result->x, x_norm);
     cgbn_store(_env, (cgbn_mem_t<params::BITS>*)result->y, y_norm);
 
-    // Store Z = 1 (affine coordinates in Jacobian form)
-    bn_t one;
-    cgbn_set_ui32(_env, one, 1);
+    // Store Z = 1 (plain form)
     cgbn_store(_env, (cgbn_mem_t<params::BITS>*)result->z, one);
 
     // ALL threads write the same value (CGBN pattern)
@@ -586,11 +668,27 @@ __global__ void msm_naive_cgbn_kernel(
 
     bool acc_is_infinity = shared_acc_is_infinity;
 
+    // Load R^2 for Montgomery conversion (once, outside loop)
+    typename bw6_msm_t<params>::bn_t R2;
+    cgbn_load(msm._env, R2, (cgbn_mem_t<params::BITS>*)BW6_761_R2_DEVICE);
+
+    // Montgomery form of 1: 1*R mod P
+    typename bw6_msm_t<params>::bn_t one_mont;
+    {
+        typename bw6_msm_t<params>::bn_t one;
+        cgbn_set_ui32(msm._env, one, 1);
+        cgbn_mont_mul(msm._env, one_mont, one, R2, P, BW6_761_NP0);
+    }
+
     // Process each point
     for (uint32_t i = 0; i < count; i++) {
-        // Load point
-        cgbn_load(msm._env, px, (cgbn_mem_t<params::BITS>*)points[i].x);
-        cgbn_load(msm._env, py, (cgbn_mem_t<params::BITS>*)points[i].y);
+        // Load point and convert to Montgomery form
+        typename bw6_msm_t<params>::bn_t px_plain, py_plain;
+        cgbn_load(msm._env, px_plain, (cgbn_mem_t<params::BITS>*)points[i].x);
+        cgbn_load(msm._env, py_plain, (cgbn_mem_t<params::BITS>*)points[i].y);
+        // Convert to Montgomery: px = px_plain * R mod P
+        cgbn_mont_mul(msm._env, px, px_plain, R2, P, BW6_761_NP0);
+        cgbn_mont_mul(msm._env, py, py_plain, R2, P, BW6_761_NP0);
         bool point_is_infinity = points[i].infinity;
 
         // Load scalar
@@ -634,10 +732,12 @@ __global__ void msm_naive_cgbn_kernel(
                     term_is_infinity = true;
                 } else {
                     // Initialize accumulator with point (for MSB)
+                    // Point coords are already in Montgomery form
+                    // ZZ=1 and ZZZ=1 must also be in Montgomery form
                     cgbn_set(msm._env, term_x, px);
                     cgbn_set(msm._env, term_y, py);
-                    cgbn_set_ui32(msm._env, term_zz, 1);
-                    cgbn_set_ui32(msm._env, term_zzz, 1);
+                    cgbn_set(msm._env, term_zz, one_mont);
+                    cgbn_set(msm._env, term_zzz, one_mont);
 
                     // Declare temps ONCE (not in loop!)
                     typename bw6_msm_t<params>::bn_t dbl_x, dbl_y, dbl_zz, dbl_zzz;
