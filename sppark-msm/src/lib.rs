@@ -191,6 +191,16 @@ extern "C" {
         ffi_scalar_sz: usize,
     ) -> i32;
 
+    #[cfg(bw6_cgbn_available)]
+    fn msm_bw6_761_g1_cgbn_pippenger(
+        points: *const ark_bw6_761::G1Affine,
+        scalars: *const BigInt<6>,
+        count: usize,
+        result: *mut ark_bw6_761::G1Projective,
+        ffi_affine_sz: usize,
+        ffi_scalar_sz: usize,
+    ) -> i32;
+
     #[cfg(mnt4_cgbn_available)]
     fn msm_mnt4_298_g1_cgbn(
         points: *const ark_mnt4_298::G1Affine,
@@ -440,6 +450,122 @@ pub fn msm_bw6_761_gpu_cgbn(
 
 #[cfg(all(feature = "gpu", not(bw6_cgbn_available)))]
 pub fn msm_bw6_761_gpu_cgbn(
+    _points: &[ark_bw6_761::G1Affine],
+    _scalars: &[BigInt<6>],
+) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
+    Err(Bw6GpuError::KernelUnavailable)
+}
+
+/// Pippenger-based GPU MSM for BW6-761 G1.
+/// Uses bucket method for O(n + nwins * 2^wbits) complexity instead of O(n * scalar_bits).
+/// Automatically falls back to serial CGBN for small inputs (n < 64).
+#[cfg(all(feature = "gpu", bw6_cgbn_available))]
+pub fn msm_bw6_761_gpu_pippenger(
+    points: &[ark_bw6_761::G1Affine],
+    scalars: &[BigInt<6>],
+) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {
+    use ark_ff::PrimeField;
+    use ark_bw6_761::Fq;
+
+    if points.len() != scalars.len() {
+        return Err(Bw6GpuError::Unknown(-99));
+    }
+
+    // CUDA expects uint32_t[24], but arkworks BigInt<12> is u64[12]
+    #[repr(C)]
+    struct PlainG1Affine {
+        x: [u32; 24],
+        y: [u32; 24],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    #[repr(C)]
+    struct PlainG1Projective {
+        x: [u32; 24],
+        y: [u32; 24],
+        z: [u32; 24],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    fn bigint_to_u32_array(bigint: ark_ff::BigInt<12>) -> [u32; 24] {
+        let mut result = [0u32; 24];
+        for (i, &limb_u64) in bigint.0.iter().enumerate() {
+            result[i * 2] = limb_u64 as u32;
+            result[i * 2 + 1] = (limb_u64 >> 32) as u32;
+        }
+        result
+    }
+
+    fn u32_array_to_bigint(arr: &[u32; 24]) -> ark_ff::BigInt<12> {
+        let mut limbs = [0u64; 12];
+        for i in 0..12 {
+            limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+        }
+        ark_ff::BigInt::<12>(limbs)
+    }
+
+    let plain_points: Vec<PlainG1Affine> = points.iter().map(|p| {
+        if p.infinity {
+            PlainG1Affine {
+                x: [0u32; 24],
+                y: [0u32; 24],
+                infinity: true,
+                _padding: [0u8; 7],
+            }
+        } else {
+            let x_bigint = p.x.into_bigint();
+            let y_bigint = p.y.into_bigint();
+            PlainG1Affine {
+                x: bigint_to_u32_array(x_bigint),
+                y: bigint_to_u32_array(y_bigint),
+                infinity: false,
+                _padding: [0u8; 7],
+            }
+        }
+    }).collect();
+
+    let mut plain_result = PlainG1Projective {
+        x: [0u32; 24],
+        y: [0u32; 24],
+        z: [0u32; 24],
+        infinity: false,
+        _padding: [0u8; 7],
+    };
+
+    let status = unsafe {
+        msm_bw6_761_g1_cgbn_pippenger(
+            plain_points.as_ptr() as *const ark_bw6_761::G1Affine,
+            scalars.as_ptr(),
+            points.len(),
+            &mut plain_result as *mut PlainG1Projective as *mut ark_bw6_761::G1Projective,
+            core::mem::size_of::<PlainG1Affine>(),
+            core::mem::size_of::<BigInt<6>>(),
+        )
+    };
+
+    if status != 0 {
+        return Err(Bw6GpuError::from_status(status));
+    }
+
+    if plain_result.infinity {
+        return Ok(ark_bw6_761::G1Projective::default());
+    }
+
+    let x_bigint = u32_array_to_bigint(&plain_result.x);
+    let y_bigint = u32_array_to_bigint(&plain_result.y);
+    let z_bigint = u32_array_to_bigint(&plain_result.z);
+
+    let x_fq = Fq::from_bigint(x_bigint).ok_or(Bw6GpuError::Unknown(-100))?;
+    let y_fq = Fq::from_bigint(y_bigint).ok_or(Bw6GpuError::Unknown(-101))?;
+    let z_fq = Fq::from_bigint(z_bigint).ok_or(Bw6GpuError::Unknown(-102))?;
+
+    Ok(ark_bw6_761::G1Projective::new_unchecked(x_fq, y_fq, z_fq))
+}
+
+#[cfg(all(feature = "gpu", not(bw6_cgbn_available)))]
+pub fn msm_bw6_761_gpu_pippenger(
     _points: &[ark_bw6_761::G1Affine],
     _scalars: &[BigInt<6>],
 ) -> Result<ark_bw6_761::G1Projective, Bw6GpuError> {

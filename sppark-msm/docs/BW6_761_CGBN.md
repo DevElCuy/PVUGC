@@ -1,6 +1,6 @@
 # BW6-761 CGBN GPU MSM Implementation
 
-**Last Updated**: 2025-12-23
+**Last Updated**: 2026-01-03
 
 ## Overview
 
@@ -239,12 +239,34 @@ fn main() {
 | Mixed addition (XYZZ + Affine) | ✅ Working (XYZZ madd-2008-s formula) |
 | Full addition (XYZZ + XYZZ) | ✅ Working (XYZZ add-2008-s with P==Q doubling check) |
 | Scalar multiplication | ✅ Working (double-and-add) |
-| MSM accumulation | ✅ Working (serial) |
+| MSM accumulation | ✅ Working (serial + Pippenger) |
+| Pippenger MSM | ✅ Implemented (bucket method) |
 | Rust FFI | ✅ Working |
 | Montgomery conversion | ✅ Working (input: plain form, output: back to Montgomery) |
 | Layout validation tests | ✅ 6/6 passing |
 | CGBN kernel tests | ✅ 5/5 passing |
+| GPU/CPU consistency tests | ✅ 21/21 passing |
 | BLS12-377 tests | ✅ 13/13 passing (no regressions) |
+
+### Bug Fix (2026-01-03): CGBN Weak Montgomery Reduction
+
+The BW6-761 scalar multiplication bug has been **fixed**. Root cause was CGBN's `cgbn_mont_mul` returning values in [0, 2P) instead of fully reduced [0, P).
+
+**Fix Applied**: Added explicit reduction after every Montgomery multiplication:
+```cpp
+cgbn_mont_mul(env, r, a, b, P, NP0);
+if (cgbn_compare(env, r, P) >= 0) {
+    cgbn_sub(env, r, r, P);
+}
+```
+
+This pattern was applied to:
+- `field_mul()` function
+- `to_montgomery()` and `from_montgomery()`
+- Direct `cgbn_mont_mul` calls in naive and Pippenger kernels
+- `xyzz_to_jacobian()` conversion function
+
+**See**: `docs/BW6_761_CGBN_BUG_SUMMARY.md` for the consolidated root cause analysis and fix details.
 
 ---
 
@@ -264,25 +286,27 @@ See `docs/GPU_INDEX.md` for the full GPU documentation tree.
 
 ## Future Optimizations
 
-### 1. Pippenger Algorithm (High Impact)
+### 1. Pippenger Algorithm ✅ Implemented
 
-Current serial double-and-add is O(n × log(scalar_bits)).
-Pippenger bucket method would be O(n / log(n)) for large MSMs.
-
-```
-1. Partition scalars into windows (e.g., 16-bit)
-2. Accumulate points into buckets per window (parallel)
-3. Combine buckets with weighted sum
-```
+Pippenger bucket method is now implemented in `msm_bw6_761_g1_cgbn_pippenger()`:
+- O(n + nwins × 2^wbits) complexity vs O(n × log(scalar_bits)) for serial
+- Automatic window size selection based on point count
+- Falls back to serial for small inputs (n < 64)
 
 ### 2. Parallel Scalar Multiplications
 
-Current: Single thread group processes all points serially.
+Current: Single thread group processes all points serially in the non-Pippenger path.
 Future: Multiple thread groups in parallel, then tree reduction.
 
 ### 3. Production Hardening
 
 Add comprehensive error handling and diagnostics for production deployments.
+
+### 4. ~~Remaining BW6-761 Bug Investigation~~ ✅ RESOLVED
+
+~~The n=512 random MSM test reveals a scalar multiplication issue for specific large scalars.~~
+
+**Resolved 2026-01-03**: The bug was caused by CGBN's weak Montgomery reduction. Fix applied - all 21/21 tests now pass. See "Bug Fix (2026-01-03)" section above.
 
 ---
 

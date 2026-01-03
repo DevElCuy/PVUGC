@@ -1,6 +1,6 @@
 # GPU Roadmap and Decision Log
 
-**Last Updated**: 2025-12-26
+**Last Updated**: 2026-01-03
 
 ## Hardware Constraints
 
@@ -50,11 +50,12 @@ Priority now considers what's viable on current 6GB hardware:
    - Est gain: **~2–8x** on MNT6 MSM steps in lean prover.
    - Status: ❌ Not started
 
-2. **Pippenger MSM for CGBN kernels (BW6/MNT)** ⬅️ Biggest algorithmic gain
+2. **Pippenger MSM for CGBN kernels (BW6/MNT)** ✅ DONE
    - Work: Replace serial double-and-add with Pippenger in CGBN kernels.
    - Est gain: **~2–6x** over current GPU (serial), **~5–15x** vs CPU.
    - Memory: Same as current - pure algorithmic improvement.
-   - Status: ❌ Not started
+   - Status: ✅ Implemented for all curves (BW6-761, MNT4-298, MNT6-298)
+   - BW6-761: ✅ All 21/21 tests passing (CGBN weak reduction bug fixed 2026-01-03)
 
 3. **BW6 sparse-quotient GPU path** (SP1 e2e bottleneck)
    - Work: BW6 kernels + FFI + integration in `compute_witness_bases()` for `Bls12Bw6Cycle`.
@@ -102,12 +103,30 @@ Priority now considers what's viable on current 6GB hardware:
 | 2025-12-25 | Phase 4 integration tests verified | 4 tests passing: GPU/CPU consistency, determinism, edge cases |
 | 2025-12-25 | Fixed CGBN duplicate symbol linker error | Added `--allow-multiple-definition` to `.cargo/config.toml` |
 | 2025-12-25 | Added `-fvisibility=hidden` to CGBN builds | Reduces symbol conflicts in multi-kernel builds |
+| 2026-01-01 | Pippenger MSM implemented for all CGBN curves | BW6-761, MNT4-298, MNT6-298 all have Pippenger kernels |
+| 2026-01-01 | BW6-761 debugging session completed | Found CPU reference bug (aliasing in gmp_field_sub), GPU code was correct |
+| 2026-01-01 | Codebase cleanup | Removed ~1500 lines of debug code, kept bug fixes (R2 constant, field_sub, point_add_mixed) |
+| 2026-01-03 | BW6-761 CGBN weak reduction bug fixed | Root cause: `cgbn_mont_mul` returns [0,2P), not [0,P). Fix: add `if (r >= P) r -= P` after each Mont mul. All 21/21 tests now pass. |
+
+## Debugging Learnings (2026-01-01 + 2026-01-03)
+
+During BW6-761 debugging, key learnings:
+
+1. **CPU reference code can have bugs too**: The GMP-based debug reference had an aliasing bug in `gmp_field_sub` that produced wrong "expected" values. Always verify reference implementations.
+
+2. **CGBN aliasing considerations**: CGBN's `cgbn_sub`/`cgbn_add` may not be alias-safe. Use temp variables when output overlaps with input.
+
+3. **Montgomery R² constant**: The original R² constant was incorrect. Verified correct value via Python: `R² mod P` where `R = 2^768`.
+
+4. **XYZZ coordinate conversion**: When comparing GPU results against arkworks, remember GPU uses XYZZ coordinates. Convert properly: `x_affine = X/ZZ`, `y_affine = Y/ZZZ`.
+
+5. **CGBN weak Montgomery reduction (2026-01-03)**: CGBN's `cgbn_mont_mul` returns values in [0, 2P) instead of fully reduced [0, P). This is documented in CGBN issue #15. Fix: add explicit `if (r >= P) r -= P` after every `cgbn_mont_mul` call. See `sppark-msm/docs/research-brief-cgbn-bw6-761-RESULTS.md` for full analysis.
 
 ## Open Questions
 
-1. When should Pippenger replace serial double-and-add for CGBN kernels?
+1. ~~When should Pippenger replace serial double-and-add for CGBN kernels?~~ ✅ Done - Pippenger implemented for all curves
 2. What is the target benchmark threshold to keep GPU enabled by default?
-3. When is it safe to remove the `ENABLE_CGBN_STUB` gate?
+3. ~~When is it safe to remove the `ENABLE_CGBN_STUB` gate?~~ ✅ Safe now - BW6-761 bug fixed (2026-01-03)
 4. How important is Apple Metal support vs CUDA-only for the roadmap?
 
 ## Success Metrics

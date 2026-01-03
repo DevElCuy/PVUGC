@@ -1,5 +1,7 @@
 # GPU Docs Index (SP1 + Lean Prover)
 
+**Last Updated**: 2026-01-03
+
 This file orders the GPU/CUDA docs involved in getting lean prover tests ready. It points to existing docs and notes which one to read at each step.
 
 ## Priority Scopes
@@ -9,8 +11,9 @@ This file orders the GPU/CUDA docs involved in getting lean prover tests ready. 
 ## Doc Map (by purpose)
 - `GPU_SUPPORT.md` - supported curves, build flags, test commands, troubleshooting.
 - `docs/BW6_CGBN_MEMORY_OPTIMIZATION.md` - kernel compile memory fixes and required release build flags.
-- `sppark-msm/docs/BW6_761_CGBN.md` - BW6-761 CGBN MSM kernel design, FFI, tests.
+- `sppark-msm/docs/BW6_761_CGBN.md` - BW6-761 CGBN MSM kernel design, FFI, tests. ✅ All 21/21 tests passing.
 - `sppark-msm/docs/MNT_CGBN.md` - MNT4/MNT6 CGBN MSM kernels, FFI, tests.
+- `docs/BW6_761_CGBN_BUG_SUMMARY.md` - CGBN weak reduction bug analysis and fix.
 - `docs/MNT_GPU_ACCELERATION.md` - end-to-end MNT GPU acceleration and sparse quotient kernels.
 - `GPU_plan.md` - prioritized roadmap for SP1/lean e2e, decisions, and next steps.
 

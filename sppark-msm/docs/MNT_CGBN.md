@@ -1,6 +1,6 @@
 # MNT4-298 / MNT6-298 CGBN GPU MSM Implementation
 
-**Last Updated**: 2025-12-24
+**Last Updated**: 2026-01-03
 
 ## Overview
 
@@ -89,16 +89,16 @@ fn bigint_to_u32_array(bigint: BigInt<5>) -> [u32; 10] {
 
 ### Kernel Algorithm
 
-**Current**: Serial double-and-add MSM (matches BW6-761 pattern)
+**Available Algorithms**:
 
-```
-For each (point_i, scalar_i):
-  1. term = scalar_mul(point_i, scalar_i)  // Double-and-add
-  2. accumulator = point_add(accumulator, term)
-Return accumulator
-```
+1. **Serial double-and-add MSM** (`msm_mnt4_298_g1_cgbn` / `msm_mnt6_298_g1_cgbn`)
+   - Complexity: O(n × log(scalar_bits))
+   - Used for small inputs or as fallback
 
-**Complexity**: O(n * log(scalar_bits))
+2. **Pippenger bucket MSM** (`msm_mnt4_298_g1_cgbn_pippenger` / `msm_mnt6_298_g1_cgbn_pippenger`)
+   - Complexity: O(n + nwins × 2^wbits)
+   - Automatic window size selection based on n
+   - Falls back to serial for n < 64
 
 ### Point Doubling (Key Difference from BW6)
 
@@ -251,8 +251,8 @@ See `docs/GPU_INDEX.md` for the full GPU documentation tree.
 
 ## Future Optimizations
 
-1. **Pippenger Algorithm**: O(n / log(n)) for large MSMs
-2. **Parallel Scalar Multiplications**: Multiple thread groups + tree reduction
+1. **Pippenger Algorithm**: ✅ Implemented (2026-01-01)
+2. **Parallel Scalar Multiplications**: Multiple thread groups + tree reduction (future)
 3. **TPI Tuning**: Optimize for 320-bit fields (currently uses TPI=8 like BW6's 768-bit)
 
 ---

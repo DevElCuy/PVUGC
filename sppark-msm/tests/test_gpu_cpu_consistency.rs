@@ -560,16 +560,179 @@ fn test_consistency_random_512() -> bool {
 
     let cpu_result = cpu_msm(&points, &scalars);
 
-    let points = ManuallyDrop::new(points);
-    let scalars = ManuallyDrop::new(scalars);
+    let points_ref = ManuallyDrop::new(points.clone());
+    let scalars_ref = ManuallyDrop::new(scalars.clone());
 
-    match gpu_msm(&points, &scalars) {
+    match gpu_msm(&points_ref, &scalars_ref) {
         Ok(gpu_result) => {
             if points_equal(&gpu_result, &cpu_result) {
                 println!("  PASS: Random n=512 MSM matches");
                 true
             } else {
                 println!("  FAIL: Results differ");
+                // Binary search to find failing point
+                println!("  Performing binary search to find failing index...");
+                let mut lo = 0usize;
+                let mut hi = n;
+                while hi - lo > 1 {
+                    let mid = (lo + hi) / 2;
+                    let pts = &points[0..mid];
+                    let scls = &scalars[0..mid];
+                    let cpu = cpu_msm(pts, scls);
+                    let pts_md = ManuallyDrop::new(pts.to_vec());
+                    let scls_md = ManuallyDrop::new(scls.to_vec());
+                    match gpu_msm(&pts_md, &scls_md) {
+                        Ok(gpu) => {
+                            if points_equal(&gpu, &cpu) {
+                                lo = mid;
+                                println!("    n=0..{}: PASS", mid);
+                            } else {
+                                hi = mid;
+                                println!("    n=0..{}: FAIL", mid);
+                            }
+                        }
+                        Err(e) => {
+                            println!("    n=0..{}: ERROR {:?}", mid, e);
+                            hi = mid;
+                        }
+                    }
+                }
+                println!("  First failing point appears at index {}", hi - 1);
+
+                // Test point 131 individually
+                let fail_idx = hi - 1;
+                println!("\n  Testing point {} individually:", fail_idx);
+                println!("    Scalar[{}] = {:?}", fail_idx, scalars[fail_idx].into_bigint());
+                println!("    Point[{}] = ({:?}, {:?})", fail_idx, points[fail_idx].x, points[fail_idx].y);
+                let single_pts = vec![points[fail_idx]];
+                let single_scls = vec![scalars[fail_idx]];
+                let single_cpu = cpu_msm(&single_pts, &single_scls);
+                let single_pts_md = ManuallyDrop::new(single_pts.clone());
+                let single_scls_md = ManuallyDrop::new(single_scls.clone());
+                match gpu_msm(&single_pts_md, &single_scls_md) {
+                    Ok(single_gpu) => {
+                        if points_equal(&single_gpu, &single_cpu) {
+                            println!("    Single point {}: PASS", fail_idx);
+                        } else {
+                            println!("    Single point {}: FAIL (scalar mul broken)", fail_idx);
+                            println!("    CPU: {:?}", single_cpu.into_affine());
+                            println!("    GPU: {:?}", single_gpu.into_affine());
+                        }
+                    }
+                    Err(e) => println!("    Single point {}: ERROR {:?}", fail_idx, e),
+                }
+
+                // Test with same scalar but generator point
+                println!("\n  Testing same scalar with generator:");
+                let gen_pts = vec![G1Affine::generator()];
+                let gen_scls = vec![scalars[fail_idx]];
+                let gen_cpu = cpu_msm(&gen_pts, &gen_scls);
+                let gen_pts_md = ManuallyDrop::new(gen_pts.clone());
+                let gen_scls_md = ManuallyDrop::new(gen_scls.clone());
+                match gpu_msm(&gen_pts_md, &gen_scls_md) {
+                    Ok(gen_gpu) => {
+                        if points_equal(&gen_gpu, &gen_cpu) {
+                            println!("    Generator * scalar[{}]: PASS", fail_idx);
+                        } else {
+                            println!("    Generator * scalar[{}]: FAIL", fail_idx);
+                        }
+                    }
+                    Err(e) => println!("    Generator * scalar[{}]: ERROR {:?}", fail_idx, e),
+                }
+
+                // Test with same point but scalar = 1
+                println!("\n  Testing same point with scalar=1:");
+                let one_scls = vec![Fr::from(1u64)];
+                let one_cpu = cpu_msm(&single_pts, &one_scls);
+                let pts_md2 = ManuallyDrop::new(single_pts.clone());
+                let one_scls_md = ManuallyDrop::new(one_scls.clone());
+                match gpu_msm(&pts_md2, &one_scls_md) {
+                    Ok(one_gpu) => {
+                        if points_equal(&one_gpu, &one_cpu) {
+                            println!("    Point[{}] * 1: PASS", fail_idx);
+                        } else {
+                            println!("    Point[{}] * 1: FAIL", fail_idx);
+                        }
+                    }
+                    Err(e) => println!("    Point[{}] * 1: ERROR {:?}", fail_idx, e),
+                }
+
+                // Test with various scalars of increasing bit sizes
+                println!("\n  Testing same point with scalars of increasing size:");
+                // Test powers of 2 to find bit threshold
+                for bits in [16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 370, 371] {
+                    let k_fr: Fr = if bits < 64 {
+                        Fr::from(1u64 << bits)
+                    } else {
+                        // Build larger scalars using doubling
+                        let mut val = Fr::from(1u64);
+                        for _ in 0..bits {
+                            val = val + val;
+                        }
+                        val
+                    };
+                    let k_scls = vec![k_fr];
+                    let k_cpu = cpu_msm(&single_pts, &k_scls);
+                    let pts_mdk = ManuallyDrop::new(single_pts.clone());
+                    let k_scls_md = ManuallyDrop::new(k_scls.clone());
+                    match gpu_msm(&pts_mdk, &k_scls_md) {
+                        Ok(k_gpu) => {
+                            if points_equal(&k_gpu, &k_cpu) {
+                                println!("    Point * 2^{}: PASS", bits);
+                            } else {
+                                println!("    Point * 2^{}: FAIL", bits);
+                            }
+                        }
+                        Err(e) => println!("    Point * 2^{}: ERROR {:?}", bits, e),
+                    }
+                }
+
+                // Binary search on scalar - test with portions of original scalar
+                println!("\n  Testing with portions of original scalar...");
+                let orig = scalars[fail_idx];
+                // Try scalar / 2, / 4, / 8, etc.
+                for power in [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256] {
+                    let divisor = Fr::from(power as u64);
+                    let divided = orig / divisor;
+                    let div_scls = vec![divided];
+                    let div_cpu = cpu_msm(&single_pts, &div_scls);
+                    let pts_md_div = ManuallyDrop::new(single_pts.clone());
+                    let div_scls_md = ManuallyDrop::new(div_scls.clone());
+                    match gpu_msm(&pts_md_div, &div_scls_md) {
+                        Ok(div_gpu) => {
+                            if points_equal(&div_gpu, &div_cpu) {
+                                println!("    Point * (scalar / {}): PASS ({} bits)", power,
+                                         divided.into_bigint().0.iter().rev()
+                                         .find(|&&x| x != 0).map(|x| 64 - x.leading_zeros()).unwrap_or(0) as i32
+                                         + divided.into_bigint().0.iter().rev().position(|&x| x != 0).map(|i| (5-i)*64).unwrap_or(0) as i32);
+                            } else {
+                                println!("    Point * (scalar / {}): FAIL ({} bits)", power,
+                                         divided.into_bigint().0.iter().rev()
+                                         .find(|&&x| x != 0).map(|x| 64 - x.leading_zeros()).unwrap_or(0) as i32
+                                         + divided.into_bigint().0.iter().rev().position(|&x| x != 0).map(|i| (5-i)*64).unwrap_or(0) as i32);
+                            }
+                        }
+                        Err(e) => println!("    Point * (scalar / {}): ERROR {:?}", power, e),
+                    }
+                }
+
+                // Test sum(0..131) + point[131]
+                println!("\n  Testing if point {} + prev_sum causes the issue:", fail_idx);
+                let prev_sum_cpu = cpu_msm(&points[0..fail_idx], &scalars[0..fail_idx]);
+                let term_cpu = cpu_msm(&single_pts, &single_scls);
+                println!("    prev_sum (0..{}): {:?}", fail_idx, prev_sum_cpu.into_affine());
+                println!("    term[{}]: {:?}", fail_idx, term_cpu.into_affine());
+                // Check if they might be equal or inverses
+                let sum_aff = prev_sum_cpu.into_affine();
+                let term_aff = term_cpu.into_affine();
+                if sum_aff.x == term_aff.x {
+                    if sum_aff.y == term_aff.y {
+                        println!("    *** Same x AND y - points are EQUAL ***");
+                    } else {
+                        println!("    *** Same x, different y - points might be INVERSES ***");
+                    }
+                }
+
                 false
             }
         }

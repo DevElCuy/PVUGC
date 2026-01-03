@@ -300,11 +300,14 @@ If you see "size mismatch" or "alignment mismatch" panics:
 
 ### CGBN Kernel Optimizations (Details)
 
-The current CGBN kernels use serial double-and-add (O(n × log(scalar_bits))). Planned improvements:
+The CGBN kernels now support both serial double-and-add and Pippenger algorithms:
 
-1. **Pippenger Algorithm**: O(n / log(n)) for large MSMs
-2. **Parallel Scalar Multiplications**: Multiple thread groups + tree reduction
-3. **Remove ENABLE_CGBN_STUB Gate**: Once correctness validated in production
+1. **Pippenger Algorithm**: ✅ Implemented for BW6-761, MNT4-298, MNT6-298
+   - O(n + nwins × 2^wbits) complexity
+   - Automatic window size selection
+   - Falls back to serial for n < 64
+2. **Parallel Scalar Multiplications**: Multiple thread groups + tree reduction (future)
+3. **Remove ENABLE_CGBN_STUB Gate**: BW6-761 bug is now fixed (2026-01-03); gate can be removed
 4. **TPI Tuning**: Optimize thread-per-instance count for MNT curves (currently TPI=8)
 
 **Key Differences in MNT Curves**:
@@ -326,10 +329,10 @@ See `sppark-msm/docs/MNT_CGBN.md` and `docs/MNT_GPU_ACCELERATION.md` for MNT imp
 | Curve | G1 GPU | Implementation | Status | Test Coverage |
 |-------|--------|---------------|--------|---------------|
 | BLS12-377 | ✅ | sppark Pippenger | Production | Comprehensive |
-| BW6-761 | ✅ | CGBN (serial) | Experimental | Basic |
-| MNT4-298 | ✅ | CGBN (serial) | Experimental | Basic |
-| MNT6-298 | ✅ | CGBN (serial) | Experimental | Basic |
+| BW6-761 | ✅ | CGBN (serial + Pippenger) | Production | 21/21 tests passing |
+| MNT4-298 | ✅ | CGBN (serial + Pippenger) | Experimental | Basic |
+| MNT6-298 | ✅ | CGBN (serial + Pippenger) | Experimental | Basic |
 | *-* G2 | ❌ | N/A | Not implemented | N/A |
 
 ---
-*Last Updated: 2025-12-25*
+*Last Updated: 2026-01-03*

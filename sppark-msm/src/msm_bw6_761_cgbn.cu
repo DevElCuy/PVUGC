@@ -47,12 +47,12 @@ __device__ __constant__ uint32_t BW6_761_NP0 = 0x8fa798dd;
 // Montgomery R^2 mod P (R = 2^768)
 // Used to convert to Montgomery form: mont(a) = a * R^2 * R^(-1) = a * R mod P
 __device__ __constant__ uint32_t BW6_761_R2_DEVICE[24] = {
-    0x4df6d8b1, 0xdb9852c1, 0x509941e1, 0xb86599b6,
-    0x5610e970, 0xc47e1405, 0xe1d13a44, 0x33d39d1f,
-    0x9b969690, 0xcc9ea946, 0xfe295c21, 0x8f3f2ae1,
-    0x058ed3a0, 0x68c240ca, 0xb46c61a0, 0x64b48c50,
-    0x4f7f1215, 0xcc141c81, 0xb4c48a96, 0x7d1c6c4a,
-    0xb1f31ec3, 0xa1ef5603, 0xa7dd2cf1, 0x0096fcba
+    0x2d1fa659, 0xc686392d, 0xf79484ab, 0x7b14c9b2,
+    0xc1d2b459, 0x7fa1e825, 0x48329d88, 0xd6ec28f8,
+    0x73a1ed40, 0x4afb427b, 0x0d5930ae, 0x972c6940,
+    0x8c995976, 0x2c7a26bf, 0xc6e57af9, 0xac52e458,
+    0x0c536dfe, 0xac731bfa, 0x0b103f50, 0x121e5c63,
+    0xb886cda4, 0x8f1b0953, 0x2da8d807, 0x00ad253c
 };
 
 // BW6-761 scalar field order (Fr, 377 bits)
@@ -134,17 +134,31 @@ public:
   /**
    * Field subtraction with modular reduction: r = (a - b) mod P
    *
-   * CRITICAL: CGBN uses unsigned arithmetic. cgbn_sub returns a borrow flag
-   * indicating underflow, NOT a negative number. We must use the return value
-   * to detect when we need to add the modulus.
+   * CRITICAL: Uses temp variables to avoid CGBN aliasing bugs.
+   * CGBN's cgbn_sub/cgbn_add may not be alias-safe when output == input.
+   *
+   * Algorithm:
+   *   if a >= b: r = a - b (result is in [0, P-1])
+   *   if a < b:  r = a + (P - b) = a - b + P (result is in [0, P-1])
    */
   __device__ __forceinline__ void field_sub(bn_t& r, const bn_t& a,
                                              const bn_t& b, const bn_t& P) {
-    // cgbn_sub returns 1 if there was a borrow (underflow), 0 otherwise
-    int32_t borrow = cgbn_sub(_env, r, a, b);
-    if (borrow != 0) {
-      cgbn_add(_env, r, r, P);
+    bn_t temp_result;  // Use temp to avoid aliasing issues
+
+    // Compare a and b
+    int32_t cmp = cgbn_compare(_env, a, b);
+    if (cmp >= 0) {
+      // a >= b: simple subtraction, result is already in [0, P-1]
+      cgbn_sub(_env, temp_result, a, b);
+    } else {
+      // a < b: compute (P - b) + a = a - b + P
+      bn_t p_minus_b;
+      cgbn_sub(_env, p_minus_b, P, b);  // P - b, no borrow since P > b
+      cgbn_add(_env, temp_result, a, p_minus_b);  // a + (P - b) = a - b + P
     }
+
+    // Copy result to output
+    cgbn_set(_env, r, temp_result);
   }
 
   /**
@@ -157,30 +171,53 @@ public:
    * mont_mul(aR, bR) = (aR * bR * R^(-1)) mod P = (ab)R mod P
    *
    * np0 = -P^(-1) mod 2^32 (Montgomery constant)
+   *
+   * CRITICAL FIX: CGBN's cgbn_mont_mul can return values in [0, 2P) instead
+   * of strictly [0, P). This is documented in CGBN issue #15. We must add
+   * explicit reduction after each Montgomery multiplication to ensure the
+   * result is fully reduced to [0, P). Without this, subsequent operations
+   * may produce incorrect results for certain input combinations.
    */
   __device__ __forceinline__ void field_mul(bn_t& r, const bn_t& a,
                                              const bn_t& b, const bn_t& P) {
     cgbn_mont_mul(_env, r, a, b, P, BW6_761_NP0);
+    // Ensure result is fully reduced to [0, P)
+    // CGBN mont_mul may return r in [P, 2P-1], so subtract P if needed
+    if (cgbn_compare(_env, r, P) >= 0) {
+      cgbn_sub(_env, r, r, P);
+    }
   }
 
   /**
    * Convert a value to Montgomery form: mont(a) = a * R mod P
    * Done by: mont(a) = mont_mul(a, R^2) = a * R^2 * R^(-1) = a * R
+   *
+   * Note: Includes reduction to handle CGBN weak reduction (issue #15)
    */
   __device__ __forceinline__ void to_montgomery(bn_t& r, const bn_t& a, const bn_t& P) {
     bn_t R2;
     cgbn_load(_env, R2, (cgbn_mem_t<params::BITS>*)BW6_761_R2_DEVICE);
     cgbn_mont_mul(_env, r, a, R2, P, BW6_761_NP0);
+    // Reduce if result >= P (CGBN weak reduction fix)
+    if (cgbn_compare(_env, r, P) >= 0) {
+      cgbn_sub(_env, r, r, P);
+    }
   }
 
   /**
    * Convert from Montgomery form to normal: a = mont(a) * R^(-1) mod P
    * Done by: mont_mul(aR, 1) = aR * 1 * R^(-1) = a
+   *
+   * Note: Includes reduction to handle CGBN weak reduction (issue #15)
    */
   __device__ __forceinline__ void from_montgomery(bn_t& r, const bn_t& a, const bn_t& P) {
     bn_t one;
     cgbn_set_ui32(_env, one, 1);
     cgbn_mont_mul(_env, r, a, one, P, BW6_761_NP0);
+    // Reduce if result >= P (CGBN weak reduction fix)
+    if (cgbn_compare(_env, r, P) >= 0) {
+      cgbn_sub(_env, r, r, P);
+    }
   }
 
   /**
@@ -215,9 +252,10 @@ public:
       const bn_t& X1, const bn_t& Y1,
       const bn_t& ZZ1, const bn_t& ZZZ1,
       // Second operand (Affine): (X2, Y2) with implicit Z2=1
-      const bn_t& X2, const bn_t& Y2
+      const bn_t& X2, const bn_t& Y2,
+      int debug_bit_pos = -1  // For debug output (unused now)
   ) {
-    bn_t U2, S2, P, R, PP, PPP, Q, temp;
+    bn_t U2, S2, P, R, PP, PPP, Q, temp, temp2;
 
     // U2 = X2 * ZZ1 (scale affine X2 to match XYZZ coordinate system)
     field_mul(U2, X2, ZZ1, P_mod);
@@ -247,10 +285,12 @@ public:
     field_sub(X3, X3, Q, P_mod);
 
     // Y3 = R*(Q - X3) - Y1*PPP
-    field_sub(temp, Q, X3, P_mod);
-    field_mul(Y3, R, temp, P_mod);
-    field_mul(temp, Y1, PPP, P_mod);
-    field_sub(Y3, Y3, temp, P_mod);
+    // Use dedicated temps to avoid aliasing in CGBN ops when r overlaps inputs.
+    bn_t q_minus_x3, y3_tmp;
+    field_sub(q_minus_x3, Q, X3, P_mod);    // q_minus_x3 = Q - X3
+    field_mul(temp2, Y1, PPP, P_mod);       // temp2 = Y1*PPP
+    field_mul(y3_tmp, R, q_minus_x3, P_mod);// y3_tmp = R * (Q-X3)
+    field_sub(Y3, y3_tmp, temp2, P_mod);    // Y3 = y3_tmp - temp2
 
     // ZZ3 = ZZ1 * PP
     field_mul(ZZ3, ZZ1, PP, P_mod);
@@ -575,41 +615,64 @@ public:
     // x_plain = (XR)/(ZZR) = X/ZZ (the R's cancel!)
     // So we can convert X,ZZ to plain, then do plain division.
 
-    // Convert from Montgomery to plain
-    bn_t X_plain, Y_plain, ZZ_plain, ZZZ_plain, one;
+    // Convert ZZ, ZZZ from Montgomery to plain for computing inverses
+    bn_t ZZ_plain, ZZZ_plain, one;
     cgbn_set_ui32(_env, one, 1);
-    cgbn_mont_mul(_env, X_plain, X, one, P, BW6_761_NP0);       // X_plain = XR * 1 * R^(-1) = X
-    cgbn_mont_mul(_env, Y_plain, Y, one, P, BW6_761_NP0);
-    cgbn_mont_mul(_env, ZZ_plain, ZZ, one, P, BW6_761_NP0);
-    cgbn_mont_mul(_env, ZZZ_plain, ZZZ, one, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, ZZ_plain, ZZ, one, P, BW6_761_NP0);     // ZZ_plain = ZZ/R
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, ZZ_plain, P) >= 0) {
+      cgbn_sub(_env, ZZ_plain, ZZ_plain, P);
+    }
+    cgbn_mont_mul(_env, ZZZ_plain, ZZZ, one, P, BW6_761_NP0);   // ZZZ_plain = ZZZ/R
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, ZZZ_plain, P) >= 0) {
+      cgbn_sub(_env, ZZZ_plain, ZZZ_plain, P);
+    }
 
     // Compute inverses in plain form
-    cgbn_modular_inverse(_env, zz_inv, ZZ_plain, P);
-    cgbn_modular_inverse(_env, zzz_inv, ZZZ_plain, P);
+    cgbn_modular_inverse(_env, zz_inv, ZZ_plain, P);            // zz_inv = ZZ^(-1) (plain)
+    cgbn_modular_inverse(_env, zzz_inv, ZZZ_plain, P);          // zzz_inv = ZZZ^(-1) (plain)
 
-    // Compute x = X * ZZ^(-1) mod P and y = Y * ZZZ^(-1) mod P
-    // Using Montgomery multiplication: need to convert to mont, multiply, convert back
-    // Or just use modular multiply which doesn't need Montgomery
-    // Actually CGBN has no direct modular multiply without wide...
-    // Let's use Montgomery: convert everything to mont, multiply, convert back
+    // Convert inverses to Montgomery form
     bn_t zz_inv_mont, zzz_inv_mont, R2;
     cgbn_load(_env, R2, (cgbn_mem_t<params::BITS>*)BW6_761_R2_DEVICE);
-    cgbn_mont_mul(_env, zz_inv_mont, zz_inv, R2, P, BW6_761_NP0);    // to Montgomery
-    cgbn_mont_mul(_env, zzz_inv_mont, zzz_inv, R2, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, zz_inv_mont, zz_inv, R2, P, BW6_761_NP0);    // zz_inv_mont = ZZ^(-1) * R
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, zz_inv_mont, P) >= 0) {
+      cgbn_sub(_env, zz_inv_mont, zz_inv_mont, P);
+    }
+    cgbn_mont_mul(_env, zzz_inv_mont, zzz_inv, R2, P, BW6_761_NP0);  // zzz_inv_mont = ZZZ^(-1) * R
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, zzz_inv_mont, P) >= 0) {
+      cgbn_sub(_env, zzz_inv_mont, zzz_inv_mont, P);
+    }
 
-    // Convert X,Y back to Montgomery for multiplication
-    bn_t X_mont, Y_mont;
-    cgbn_mont_mul(_env, X_mont, X_plain, R2, P, BW6_761_NP0);
-    cgbn_mont_mul(_env, Y_mont, Y_plain, R2, P, BW6_761_NP0);
-
-    // Multiply in Montgomery form
+    // Multiply in Montgomery form: X and Y are already in Montgomery form
+    // x_norm_mont = X * zz_inv_mont = (X*R) * (ZZ^(-1)*R) * R^(-1) = X * ZZ^(-1) * R
+    // y_norm_mont = Y * zzz_inv_mont = (Y*R) * (ZZZ^(-1)*R) * R^(-1) = Y * ZZZ^(-1) * R
     bn_t x_mont, y_mont;
-    cgbn_mont_mul(_env, x_mont, X_mont, zz_inv_mont, P, BW6_761_NP0);
-    cgbn_mont_mul(_env, y_mont, Y_mont, zzz_inv_mont, P, BW6_761_NP0);
+    cgbn_mont_mul(_env, x_mont, X, zz_inv_mont, P, BW6_761_NP0);
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, x_mont, P) >= 0) {
+      cgbn_sub(_env, x_mont, x_mont, P);
+    }
+    cgbn_mont_mul(_env, y_mont, Y, zzz_inv_mont, P, BW6_761_NP0);
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, y_mont, P) >= 0) {
+      cgbn_sub(_env, y_mont, y_mont, P);
+    }
 
-    // Convert result to plain form for output
-    cgbn_mont_mul(_env, x_norm, x_mont, one, P, BW6_761_NP0);
-    cgbn_mont_mul(_env, y_norm, y_mont, one, P, BW6_761_NP0);
+    // Convert result from Montgomery to plain form for output
+    cgbn_mont_mul(_env, x_norm, x_mont, one, P, BW6_761_NP0);   // x_norm = X/ZZ (plain)
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, x_norm, P) >= 0) {
+      cgbn_sub(_env, x_norm, x_norm, P);
+    }
+    cgbn_mont_mul(_env, y_norm, y_mont, one, P, BW6_761_NP0);   // y_norm = Y/ZZZ (plain)
+    // CGBN weak reduction fix
+    if (cgbn_compare(_env, y_norm, P) >= 0) {
+      cgbn_sub(_env, y_norm, y_norm, P);
+    }
 
     // Store normalized affine coordinates (in plain form)
     cgbn_store(_env, (cgbn_mem_t<params::BITS>*)result->x, x_norm);
@@ -678,6 +741,10 @@ __global__ void msm_naive_cgbn_kernel(
         typename bw6_msm_t<params>::bn_t one;
         cgbn_set_ui32(msm._env, one, 1);
         cgbn_mont_mul(msm._env, one_mont, one, R2, P, BW6_761_NP0);
+        // CGBN weak reduction fix: ensure one_mont < P
+        if (cgbn_compare(msm._env, one_mont, P) >= 0) {
+            cgbn_sub(msm._env, one_mont, one_mont, P);
+        }
     }
 
     // Process each point
@@ -688,7 +755,15 @@ __global__ void msm_naive_cgbn_kernel(
         cgbn_load(msm._env, py_plain, (cgbn_mem_t<params::BITS>*)points[i].y);
         // Convert to Montgomery: px = px_plain * R mod P
         cgbn_mont_mul(msm._env, px, px_plain, R2, P, BW6_761_NP0);
+        // CGBN weak reduction fix
+        if (cgbn_compare(msm._env, px, P) >= 0) {
+            cgbn_sub(msm._env, px, px, P);
+        }
         cgbn_mont_mul(msm._env, py, py_plain, R2, P, BW6_761_NP0);
+        // CGBN weak reduction fix
+        if (cgbn_compare(msm._env, py, P) >= 0) {
+            cgbn_sub(msm._env, py, py, P);
+        }
         bool point_is_infinity = points[i].infinity;
 
         // Load scalar
@@ -1031,5 +1106,790 @@ cleanup_error:
     cudaFree(d_scalars);
     cudaFree(d_result);
     cgbn_error_report_free(d_report);
+    return BW6_MSM_ERROR_CUDA_RUNTIME;
+}
+
+// Pippenger configuration for BW6-761
+#define PIPPENGER_MIN_WBITS 8
+#define PIPPENGER_MAX_WBITS 16
+#define PIPPENGER_SCALAR_BITS_BW6 377  // BW6-761 Fr has 377 bits
+
+// Helper: Compute optimal window size based on point count
+__host__ __device__ __forceinline__
+uint32_t compute_optimal_wbits_bw6(uint32_t n) {
+    if (n == 0) return PIPPENGER_MIN_WBITS;
+
+    // wbits ~ log2(n) - 1, clamped to [MIN_WBITS, MAX_WBITS]
+    uint32_t log2_n = 0;
+    uint32_t temp = n;
+    while (temp > 1) { temp >>= 1; log2_n++; }
+
+    int32_t wbits = (int32_t)log2_n - 1;
+    if (wbits < PIPPENGER_MIN_WBITS) wbits = PIPPENGER_MIN_WBITS;
+    if (wbits > PIPPENGER_MAX_WBITS) wbits = PIPPENGER_MAX_WBITS;
+
+    return (uint32_t)wbits;
+}
+
+// Helper: Compute number of windows for given scalar bits and window size
+__host__ __device__ __forceinline__
+uint32_t compute_nwins_bw6(uint32_t scalar_bits, uint32_t wbits) {
+    return (scalar_bits + wbits - 1) / wbits;
+}
+
+// XYZZ bucket with infinity flag for Pippenger (768-bit fields)
+typedef struct {
+    uint32_t x[24];
+    uint32_t y[24];
+    uint32_t zz[24];
+    uint32_t zzz[24];
+    bool is_infinity;
+    uint8_t _padding[7];  // Align to 8 bytes
+} __align__(8) bucket_xyzz_bw6_t;
+
+// ============================================================================
+// KERNEL 1: Scalar Breakdown (extract signed digits) - BW6-761
+// ============================================================================
+__global__ void breakdown_scalars_bw6_761(
+    uint32_t* digits,           // Output: [n * nwins] packed digits
+    const scalar_cgbn_t* scalars,  // Input: 12 x u32 limbs per scalar
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const uint32_t* scalar = scalars[idx].limbs;
+    const uint32_t wmask = (1u << wbits) - 1;
+    const uint32_t half_buckets = 1u << (wbits - 1);
+
+    // Track carry for Booth encoding across windows
+    uint32_t carry = 0;
+
+    for (uint32_t win = 0; win < nwins; win++) {
+        uint32_t bit_offset = win * wbits;
+        uint32_t limb_idx = bit_offset / 32;
+        uint32_t bit_idx = bit_offset % 32;
+
+        // Extract wbits from scalar (may span two limbs)
+        // BW6-761 scalars are 12 limbs
+        uint64_t window_val = 0;
+        if (limb_idx < 12) {
+            window_val = scalar[limb_idx];
+        }
+        if (limb_idx + 1 < 12 && bit_idx + wbits > 32) {
+            window_val |= ((uint64_t)scalar[limb_idx + 1]) << 32;
+        }
+        window_val = (window_val >> bit_idx) & wmask;
+
+        // Add carry from previous window's Booth encoding
+        window_val += carry;
+        carry = 0;
+
+        // Booth encoding: if value > half_buckets, subtract 2^wbits and carry 1
+        uint32_t sign = 0;
+        if (window_val > half_buckets) {
+            window_val = (1u << wbits) - window_val;
+            sign = 1;
+            carry = 1;
+        }
+
+        // Store packed digit: bucket_id in low 16 bits, sign in bit 31
+        uint32_t packed = (uint32_t)window_val | (sign << 31);
+        digits[win * n + idx] = packed;
+    }
+}
+
+// ============================================================================
+// KERNEL 2: Histogram (count points per bucket)
+// ============================================================================
+__global__ void histogram_buckets_bw6_761(
+    uint32_t* histogram,        // Output: [nwins * num_buckets] counts
+    const uint32_t* digits,     // Input: [n * nwins] packed digits
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+
+    for (uint32_t win = 0; win < nwins; win++) {
+        uint32_t packed = digits[win * n + idx];
+        uint32_t bucket_id = packed & 0xFFFF;
+
+        if (bucket_id > 0) {
+            uint32_t hist_idx = win * num_buckets + bucket_id;
+            atomicAdd(&histogram[hist_idx], 1);
+        }
+    }
+}
+
+// ============================================================================
+// KERNEL 3: Prefix Sum (compute bucket offsets from histogram)
+// ============================================================================
+__global__ void prefix_sum_histogram_bw6_761(
+    uint32_t* offsets,          // Output: [nwins * num_buckets] offsets
+    const uint32_t* histogram,  // Input: [nwins * num_buckets] counts
+    uint32_t nwins,
+    uint32_t num_buckets
+) {
+    uint32_t win = blockIdx.x * blockDim.x + threadIdx.x;
+    if (win >= nwins) return;
+
+    uint32_t base = win * num_buckets;
+    uint32_t sum = 0;
+
+    for (uint32_t b = 0; b < num_buckets; b++) {
+        uint32_t count = histogram[base + b];
+        offsets[base + b] = sum;
+        sum += count;
+    }
+}
+
+// ============================================================================
+// KERNEL 4: Scatter (sort point indices into bucket order)
+// ============================================================================
+__global__ void scatter_to_buckets_bw6_761(
+    uint32_t* sorted_indices,   // Output: [nwins * n] sorted point indices
+    uint32_t* bucket_counters,  // Working: [nwins * num_buckets] current counts
+    const uint32_t* offsets,    // Input: [nwins * num_buckets] bucket offsets
+    const uint32_t* digits,     // Input: [n * nwins] packed digits
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+
+    for (uint32_t win = 0; win < nwins; win++) {
+        uint32_t packed = digits[win * n + idx];
+        uint32_t bucket_id = packed & 0xFFFF;
+        uint32_t sign = (packed >> 31) & 1;
+
+        if (bucket_id > 0) {
+            uint32_t hist_idx = win * num_buckets + bucket_id;
+            uint32_t pos = offsets[hist_idx] + atomicAdd(&bucket_counters[hist_idx], 1);
+
+            // Pack point index with sign: idx | (sign << 31)
+            sorted_indices[win * n + pos] = idx | (sign << 31);
+        }
+    }
+}
+
+// ============================================================================
+// KERNEL 5: Bucket Accumulation (parallel bucket addition with CGBN)
+// ============================================================================
+template<class params>
+__global__ void accumulate_buckets_bw6_761(
+    cgbn_error_report_t* report,
+    bucket_xyzz_bw6_t* buckets,     // Output: [nwins * num_buckets]
+    const affine_cgbn_t* points,    // Input: [n] points
+    const uint32_t* sorted_indices, // Input: [nwins * n] sorted indices
+    const uint32_t* offsets,        // Input: [nwins * num_buckets] offsets
+    const uint32_t* histogram,      // Input: [nwins * num_buckets] counts
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / params::TPI;
+
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+    uint32_t total_buckets = nwins * num_buckets;
+
+    if ((uint32_t)instance >= total_buckets) return;
+
+    uint32_t win = instance / num_buckets;
+    uint32_t bucket_id = instance % num_buckets;
+
+    // Skip bucket 0 (identity bucket)
+    if (bucket_id == 0) {
+        buckets[instance].is_infinity = true;
+        return;
+    }
+
+    // Get bucket range from histogram
+    uint32_t hist_idx = win * num_buckets + bucket_id;
+    uint32_t start = offsets[hist_idx];
+    uint32_t count = histogram[hist_idx];
+
+    // Initialize CGBN
+    bw6_msm_t<params> msm(cgbn_report_monitor, report, instance);
+    typename bw6_msm_t<params>::bn_t P, px, py, px_plain, py_plain;
+    typename bw6_msm_t<params>::bn_t acc_x, acc_y, acc_zz, acc_zzz;
+    typename bw6_msm_t<params>::bn_t tmp_x, tmp_y, tmp_zz, tmp_zzz;
+
+    // Load modulus and R^2 for Montgomery conversion
+    cgbn_load(msm._env, P, (cgbn_mem_t<params::BITS>*)BW6_761_P_DEVICE);
+    typename bw6_msm_t<params>::bn_t R2;
+    cgbn_load(msm._env, R2, (cgbn_mem_t<params::BITS>*)BW6_761_R2_DEVICE);
+
+    // Montgomery form of 1: 1*R mod P
+    typename bw6_msm_t<params>::bn_t one_mont;
+    {
+        typename bw6_msm_t<params>::bn_t one;
+        cgbn_set_ui32(msm._env, one, 1);
+        cgbn_mont_mul(msm._env, one_mont, one, R2, P, BW6_761_NP0);
+        // CGBN weak reduction fix
+        if (cgbn_compare(msm._env, one_mont, P) >= 0) {
+            cgbn_sub(msm._env, one_mont, one_mont, P);
+        }
+    }
+
+    bool acc_is_infinity = true;
+
+    // Accumulate all points in this bucket
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t packed_idx = sorted_indices[win * n + start + i];
+        uint32_t point_idx = packed_idx & 0x7FFFFFFF;
+        bool negate = (packed_idx >> 31) != 0;
+
+        // Skip points at infinity
+        if (points[point_idx].infinity) continue;
+
+        // Load point in plain form and convert to Montgomery form
+        cgbn_load(msm._env, px_plain, (cgbn_mem_t<params::BITS>*)points[point_idx].x);
+        cgbn_load(msm._env, py_plain, (cgbn_mem_t<params::BITS>*)points[point_idx].y);
+        cgbn_mont_mul(msm._env, px, px_plain, R2, P, BW6_761_NP0);
+        // CGBN weak reduction fix
+        if (cgbn_compare(msm._env, px, P) >= 0) {
+            cgbn_sub(msm._env, px, px, P);
+        }
+        cgbn_mont_mul(msm._env, py, py_plain, R2, P, BW6_761_NP0);
+        // CGBN weak reduction fix
+        if (cgbn_compare(msm._env, py, P) >= 0) {
+            cgbn_sub(msm._env, py, py, P);
+        }
+
+        // Apply negation if needed (negate y coordinate in Montgomery form)
+        if (negate) {
+            typename bw6_msm_t<params>::bn_t neg_y;
+            cgbn_sub(msm._env, neg_y, P, py);
+            cgbn_set(msm._env, py, neg_y);
+        }
+
+        if (acc_is_infinity) {
+            // First point: initialize accumulator as XYZZ with Z=1 (in Montgomery form)
+            cgbn_set(msm._env, acc_x, px);
+            cgbn_set(msm._env, acc_y, py);
+            cgbn_set(msm._env, acc_zz, one_mont);
+            cgbn_set(msm._env, acc_zzz, one_mont);
+            acc_is_infinity = false;
+        } else {
+            // Add point using mixed addition (XYZZ + Affine)
+            msm.point_add_mixed(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                               acc_x, acc_y, acc_zz, acc_zzz,
+                               px, py);
+
+            // Check if result is zero (happens when adding inverse points)
+            bool result_is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+            if (result_is_zero) {
+                acc_is_infinity = true;
+            } else {
+                cgbn_set(msm._env, acc_x, tmp_x);
+                cgbn_set(msm._env, acc_y, tmp_y);
+                cgbn_set(msm._env, acc_zz, tmp_zz);
+                cgbn_set(msm._env, acc_zzz, tmp_zzz);
+            }
+        }
+    }
+
+    // Store bucket result
+    buckets[instance].is_infinity = acc_is_infinity;
+    if (!acc_is_infinity) {
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].x, acc_x);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].y, acc_y);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].zz, acc_zz);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].zzz, acc_zzz);
+    }
+}
+
+// ============================================================================
+// KERNEL 6: Bucket Integration (Horner-like sum within each window)
+// ============================================================================
+template<class params>
+__global__ void integrate_buckets_bw6_761(
+    cgbn_error_report_t* report,
+    bucket_xyzz_bw6_t* window_sums,     // Output: [nwins]
+    const bucket_xyzz_bw6_t* buckets,   // Input: [nwins * num_buckets]
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / params::TPI;
+
+    if ((uint32_t)instance >= nwins) return;
+
+    uint32_t win = instance;
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+    uint32_t bucket_base = win * num_buckets;
+
+    // Initialize CGBN
+    bw6_msm_t<params> msm(cgbn_report_monitor, report, instance);
+    typename bw6_msm_t<params>::bn_t P;
+    typename bw6_msm_t<params>::bn_t acc_x, acc_y, acc_zz, acc_zzz;
+    typename bw6_msm_t<params>::bn_t sum_x, sum_y, sum_zz, sum_zzz;
+    typename bw6_msm_t<params>::bn_t tmp_x, tmp_y, tmp_zz, tmp_zzz;
+    typename bw6_msm_t<params>::bn_t bkt_x, bkt_y, bkt_zz, bkt_zzz;
+
+    // Load modulus
+    cgbn_load(msm._env, P, (cgbn_mem_t<params::BITS>*)BW6_761_P_DEVICE);
+
+    bool acc_is_infinity = true;
+    bool sum_is_infinity = true;
+
+    // Horner-like integration: for b = num_buckets-1 down to 1:
+    //   acc += bucket[b]
+    //   sum += acc
+    for (int32_t b = num_buckets - 1; b >= 1; b--) {
+        uint32_t bkt_idx = bucket_base + b;
+
+        // First: acc += bucket[b]
+        if (!buckets[bkt_idx].is_infinity) {
+            cgbn_load(msm._env, bkt_x, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].x);
+            cgbn_load(msm._env, bkt_y, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].y);
+            cgbn_load(msm._env, bkt_zz, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].zz);
+            cgbn_load(msm._env, bkt_zzz, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].zzz);
+
+            if (acc_is_infinity) {
+                cgbn_set(msm._env, acc_x, bkt_x);
+                cgbn_set(msm._env, acc_y, bkt_y);
+                cgbn_set(msm._env, acc_zz, bkt_zz);
+                cgbn_set(msm._env, acc_zzz, bkt_zzz);
+                acc_is_infinity = false;
+            } else {
+                // Check if acc and bucket[b] are the same point
+                typename bw6_msm_t<params>::bn_t lhs, rhs;
+                msm.field_mul(lhs, acc_x, bkt_zz, P);
+                msm.field_mul(rhs, bkt_x, acc_zz, P);
+                bool same_x = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                msm.field_mul(lhs, acc_y, bkt_zzz, P);
+                msm.field_mul(rhs, bkt_y, acc_zzz, P);
+                bool same_y = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                if (same_x && same_y) {
+                    // Same point: use doubling
+                    msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                    acc_x, acc_y, acc_zz, acc_zzz);
+                    cgbn_set(msm._env, acc_x, tmp_x);
+                    cgbn_set(msm._env, acc_y, tmp_y);
+                    cgbn_set(msm._env, acc_zz, tmp_zz);
+                    cgbn_set(msm._env, acc_zzz, tmp_zzz);
+                } else if (same_x) {
+                    // Inverse points -> result is infinity
+                    acc_is_infinity = true;
+                } else {
+                    // Different points: use standard addition
+                    msm.point_add(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                 acc_x, acc_y, acc_zz, acc_zzz,
+                                 bkt_x, bkt_y, bkt_zz, bkt_zzz);
+
+                    bool result_is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+                    if (result_is_zero) {
+                        acc_is_infinity = true;
+                    } else {
+                        cgbn_set(msm._env, acc_x, tmp_x);
+                        cgbn_set(msm._env, acc_y, tmp_y);
+                        cgbn_set(msm._env, acc_zz, tmp_zz);
+                        cgbn_set(msm._env, acc_zzz, tmp_zzz);
+                    }
+                }
+            }
+        }
+
+        // Second: sum += acc
+        if (!acc_is_infinity) {
+            if (sum_is_infinity) {
+                cgbn_set(msm._env, sum_x, acc_x);
+                cgbn_set(msm._env, sum_y, acc_y);
+                cgbn_set(msm._env, sum_zz, acc_zz);
+                cgbn_set(msm._env, sum_zzz, acc_zzz);
+                sum_is_infinity = false;
+            } else {
+                // Check if sum and acc are the same point
+                typename bw6_msm_t<params>::bn_t lhs, rhs;
+                msm.field_mul(lhs, sum_x, acc_zz, P);
+                msm.field_mul(rhs, acc_x, sum_zz, P);
+                bool same_x = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                msm.field_mul(lhs, sum_y, acc_zzz, P);
+                msm.field_mul(rhs, acc_y, sum_zzz, P);
+                bool same_y = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                if (same_x && same_y) {
+                    // Same point: use doubling
+                    msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                    sum_x, sum_y, sum_zz, sum_zzz);
+                    cgbn_set(msm._env, sum_x, tmp_x);
+                    cgbn_set(msm._env, sum_y, tmp_y);
+                    cgbn_set(msm._env, sum_zz, tmp_zz);
+                    cgbn_set(msm._env, sum_zzz, tmp_zzz);
+                } else if (same_x) {
+                    // Inverse points -> result is infinity
+                    sum_is_infinity = true;
+                } else {
+                    // Different points: use standard addition
+                    msm.point_add(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                 sum_x, sum_y, sum_zz, sum_zzz,
+                                 acc_x, acc_y, acc_zz, acc_zzz);
+
+                    bool result_is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+                    if (result_is_zero) {
+                        sum_is_infinity = true;
+                    } else {
+                        cgbn_set(msm._env, sum_x, tmp_x);
+                        cgbn_set(msm._env, sum_y, tmp_y);
+                        cgbn_set(msm._env, sum_zz, tmp_zz);
+                        cgbn_set(msm._env, sum_zzz, tmp_zzz);
+                    }
+                }
+            }
+        }
+    }
+
+    // Store window sum
+    window_sums[win].is_infinity = sum_is_infinity;
+    if (!sum_is_infinity) {
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].x, sum_x);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].y, sum_y);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].zz, sum_zz);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].zzz, sum_zzz);
+    }
+}
+
+// ============================================================================
+// KERNEL 7: Window Combination (merge window sums with doublings)
+// ============================================================================
+template<class params>
+__global__ void combine_windows_bw6_761(
+    cgbn_error_report_t* report,
+    jacobian_cgbn_t* result_out,
+    const bucket_xyzz_bw6_t* window_sums,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / params::TPI;
+    if (instance != 0) return;
+
+    bw6_msm_t<params> msm(cgbn_report_monitor, report, instance);
+    typename bw6_msm_t<params>::bn_t P;
+    typename bw6_msm_t<params>::bn_t res_x, res_y, res_zz, res_zzz;
+    typename bw6_msm_t<params>::bn_t tmp_x, tmp_y, tmp_zz, tmp_zzz;
+    typename bw6_msm_t<params>::bn_t win_x, win_y, win_zz, win_zzz;
+
+    cgbn_load(msm._env, P, (cgbn_mem_t<params::BITS>*)BW6_761_P_DEVICE);
+
+    bool result_is_infinity = true;
+
+    // Start with highest window
+    for (int32_t w = nwins - 1; w >= 0; w--) {
+        // Double result wbits times (if not first iteration)
+        if (w < (int32_t)nwins - 1 && !result_is_infinity) {
+            for (uint32_t d = 0; d < wbits; d++) {
+                msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                res_x, res_y, res_zz, res_zzz);
+                cgbn_set(msm._env, res_x, tmp_x);
+                cgbn_set(msm._env, res_y, tmp_y);
+                cgbn_set(msm._env, res_zz, tmp_zz);
+                cgbn_set(msm._env, res_zzz, tmp_zzz);
+            }
+        }
+
+        // Add window sum
+        if (!window_sums[w].is_infinity) {
+            cgbn_load(msm._env, win_x, (cgbn_mem_t<params::BITS>*)window_sums[w].x);
+            cgbn_load(msm._env, win_y, (cgbn_mem_t<params::BITS>*)window_sums[w].y);
+            cgbn_load(msm._env, win_zz, (cgbn_mem_t<params::BITS>*)window_sums[w].zz);
+            cgbn_load(msm._env, win_zzz, (cgbn_mem_t<params::BITS>*)window_sums[w].zzz);
+
+            if (result_is_infinity) {
+                cgbn_set(msm._env, res_x, win_x);
+                cgbn_set(msm._env, res_y, win_y);
+                cgbn_set(msm._env, res_zz, win_zz);
+                cgbn_set(msm._env, res_zzz, win_zzz);
+                result_is_infinity = false;
+            } else {
+                // Check if result and window_sum are the same point
+                typename bw6_msm_t<params>::bn_t lhs, rhs;
+                msm.field_mul(lhs, res_x, win_zz, P);
+                msm.field_mul(rhs, win_x, res_zz, P);
+                bool same_x = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                msm.field_mul(lhs, res_y, win_zzz, P);
+                msm.field_mul(rhs, win_y, res_zzz, P);
+                bool same_y = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                if (same_x && same_y) {
+                    // Same point: use doubling
+                    msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                    res_x, res_y, res_zz, res_zzz);
+                    cgbn_set(msm._env, res_x, tmp_x);
+                    cgbn_set(msm._env, res_y, tmp_y);
+                    cgbn_set(msm._env, res_zz, tmp_zz);
+                    cgbn_set(msm._env, res_zzz, tmp_zzz);
+                } else if (same_x) {
+                    // Inverse points -> result is infinity
+                    result_is_infinity = true;
+                } else {
+                    // Different points: use standard addition
+                    msm.point_add(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                 res_x, res_y, res_zz, res_zzz,
+                                 win_x, win_y, win_zz, win_zzz);
+
+                    bool is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+                    if (is_zero) {
+                        result_is_infinity = true;
+                    } else {
+                        cgbn_set(msm._env, res_x, tmp_x);
+                        cgbn_set(msm._env, res_y, tmp_y);
+                        cgbn_set(msm._env, res_zz, tmp_zz);
+                        cgbn_set(msm._env, res_zzz, tmp_zzz);
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert XYZZ to Jacobian
+    if (result_is_infinity) {
+        for (int i = 0; i < 24; i++) {
+            result_out->x[i] = 0;
+            result_out->y[i] = 0;
+            result_out->z[i] = 0;
+        }
+        result_out->infinity = true;
+    } else {
+        msm.xyzz_to_jacobian(P, result_out, res_x, res_y, res_zz, res_zzz);
+    }
+}
+
+// ============================================================================
+// FFI Entry Point: Pippenger MSM for BW6-761 G1
+// ============================================================================
+extern "C" int msm_bw6_761_g1_cgbn_pippenger(
+    const void* points_ptr,
+    const void* scalars_ptr,
+    size_t count,
+    void* result_ptr,
+    size_t ffi_affine_sz,
+    size_t ffi_scalar_sz
+) {
+    // Validate FFI layout
+    if (ffi_affine_sz != sizeof(affine_cgbn_t)) {
+        fprintf(stderr, "[BW6-761 Pippenger] ERROR: Affine size mismatch\n");
+        return BW6_MSM_ERROR_AFFINE_LAYOUT;
+    }
+    if (ffi_scalar_sz != sizeof(scalar_cgbn_t)) {
+        fprintf(stderr, "[BW6-761 Pippenger] ERROR: Scalar size mismatch\n");
+        return BW6_MSM_ERROR_SCALAR_LAYOUT;
+    }
+
+    // Handle edge case
+    if (count == 0) {
+        jacobian_cgbn_t* result = static_cast<jacobian_cgbn_t*>(result_ptr);
+        memset(result, 0, sizeof(jacobian_cgbn_t));
+        result->infinity = true;
+        return BW6_MSM_SUCCESS;
+    }
+
+    // NOTE: Serial fallback disabled - serial BW6 MSM has a pre-existing bug
+    // For very small inputs, use Pippenger anyway (until serial is fixed)
+    // if (count < 64) {
+    //     return msm_bw6_761_g1_cgbn(points_ptr, scalars_ptr, count,
+    //                                result_ptr, ffi_affine_sz, ffi_scalar_sz);
+    // }
+
+    const affine_cgbn_t* points = static_cast<const affine_cgbn_t*>(points_ptr);
+    const scalar_cgbn_t* scalars = static_cast<const scalar_cgbn_t*>(scalars_ptr);
+    jacobian_cgbn_t* result = static_cast<jacobian_cgbn_t*>(result_ptr);
+
+    // Compute optimal parameters
+    uint32_t n = (uint32_t)count;
+    uint32_t wbits = compute_optimal_wbits_bw6(n);
+    uint32_t nwins = compute_nwins_bw6(PIPPENGER_SCALAR_BITS_BW6, wbits);
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+    uint32_t total_buckets = nwins * num_buckets;
+
+    // Allocate device memory
+    cudaError_t err;
+    affine_cgbn_t* d_points = nullptr;
+    scalar_cgbn_t* d_scalars = nullptr;
+    uint32_t* d_digits = nullptr;
+    uint32_t* d_histogram = nullptr;
+    uint32_t* d_offsets = nullptr;
+    uint32_t* d_bucket_counters = nullptr;
+    uint32_t* d_sorted_indices = nullptr;
+    bucket_xyzz_bw6_t* d_buckets = nullptr;
+    bucket_xyzz_bw6_t* d_window_sums = nullptr;
+    jacobian_cgbn_t* d_result = nullptr;
+    cgbn_error_report_t* d_report = nullptr;
+
+    // Allocation
+    err = cudaMalloc(&d_points, sizeof(affine_cgbn_t) * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_scalars, sizeof(scalar_cgbn_t) * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_digits, sizeof(uint32_t) * nwins * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_histogram, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_offsets, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_bucket_counters, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_sorted_indices, sizeof(uint32_t) * nwins * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_buckets, sizeof(bucket_xyzz_bw6_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_window_sums, sizeof(bucket_xyzz_bw6_t) * nwins);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMalloc(&d_result, sizeof(jacobian_cgbn_t));
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cgbn_error_report_alloc(&d_report);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    // Copy inputs to device
+    err = cudaMemcpy(d_points, points, sizeof(affine_cgbn_t) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMemcpy(d_scalars, scalars, sizeof(scalar_cgbn_t) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    // Zero histograms and counters
+    err = cudaMemset(d_histogram, 0, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    err = cudaMemset(d_bucket_counters, 0, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    {
+        // Kernel launches
+        int threads = 256;
+        int blocks_n = (n + threads - 1) / threads;
+        int blocks_nwins = (nwins + threads - 1) / threads;
+
+        // 1. Breakdown scalars
+        breakdown_scalars_bw6_761<<<blocks_n, threads>>>(
+            d_digits, d_scalars, n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        // 2. Build histogram
+        histogram_buckets_bw6_761<<<blocks_n, threads>>>(
+            d_histogram, d_digits, n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        // 3. Prefix sum for offsets
+        prefix_sum_histogram_bw6_761<<<blocks_nwins, threads>>>(
+            d_offsets, d_histogram, nwins, num_buckets
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        // 4. Scatter to buckets
+        scatter_to_buckets_bw6_761<<<blocks_n, threads>>>(
+            d_sorted_indices, d_bucket_counters, d_offsets, d_digits,
+            n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        // 5. Accumulate buckets (CGBN kernel)
+        int tpi = bw6_cgbn_params_t::TPI;
+        int threads_accumulate = 32 * tpi;  // 32 CGBN instances per block
+        int instances_needed = total_buckets;
+        int blocks_accumulate = (instances_needed * tpi + threads_accumulate - 1) / threads_accumulate;
+
+        accumulate_buckets_bw6_761<bw6_cgbn_params_t><<<blocks_accumulate, threads_accumulate>>>(
+            d_report, d_buckets, d_points, d_sorted_indices, d_offsets, d_histogram,
+            n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        // 6. Integrate buckets (CGBN kernel)
+        int instances_integrate = nwins;
+        int blocks_integrate = (instances_integrate * tpi + threads_accumulate - 1) / threads_accumulate;
+
+        integrate_buckets_bw6_761<bw6_cgbn_params_t><<<blocks_integrate, threads_accumulate>>>(
+            d_report, d_window_sums, d_buckets, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        // 7. Combine windows (single CGBN instance)
+        combine_windows_bw6_761<bw6_cgbn_params_t><<<1, tpi>>>(
+            d_report, d_result, d_window_sums, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+    }
+
+    // Check CGBN errors
+    if (cgbn_error_report_check(d_report)) {
+        fprintf(stderr, "[BW6-761 Pippenger] ERROR: CGBN error detected\n");
+        goto pippenger_cleanup_error_bw6;
+    }
+
+    // Copy result back
+    err = cudaMemcpy(result, d_result, sizeof(jacobian_cgbn_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) goto pippenger_cleanup_error_bw6;
+
+    // Cleanup
+    cudaFree(d_points);
+    cudaFree(d_scalars);
+    cudaFree(d_digits);
+    cudaFree(d_histogram);
+    cudaFree(d_offsets);
+    cudaFree(d_bucket_counters);
+    cudaFree(d_sorted_indices);
+    cudaFree(d_buckets);
+    cudaFree(d_window_sums);
+    cudaFree(d_result);
+    cgbn_error_report_free(d_report);
+
+    return BW6_MSM_SUCCESS;
+
+pippenger_cleanup_error_bw6:
+    if (d_points) cudaFree(d_points);
+    if (d_scalars) cudaFree(d_scalars);
+    if (d_digits) cudaFree(d_digits);
+    if (d_histogram) cudaFree(d_histogram);
+    if (d_offsets) cudaFree(d_offsets);
+    if (d_bucket_counters) cudaFree(d_bucket_counters);
+    if (d_sorted_indices) cudaFree(d_sorted_indices);
+    if (d_buckets) cudaFree(d_buckets);
+    if (d_window_sums) cudaFree(d_window_sums);
+    if (d_result) cudaFree(d_result);
+    if (d_report) cgbn_error_report_free(d_report);
     return BW6_MSM_ERROR_CUDA_RUNTIME;
 }
