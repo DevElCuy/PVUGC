@@ -28,11 +28,26 @@ use arkworks_groth16::RecursionCycle;
 /// Number of random samples to test (higher = more confidence)
 const NUM_RANDOM_SAMPLES: usize = 10;
 
+fn assert_gpu_available() {
+    #[cfg(feature = "gpu")]
+    {
+        assert!(
+            sppark_msm::sparse_quotient_gpu_available(),
+            "GPU sparse quotient kernel not available; ensure CUDA is built and run with --features gpu"
+        );
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        panic!("GPU feature not enabled; run with --features gpu to validate GPU paths");
+    }
+}
+
 #[test]
 #[ignore]
 fn test_c_gap_random_sample_validation() {
     println!("\n=== C-Gap Random Sample Validation Test ===\n");
     println!("Testing {} random (non-canonical) statements...", NUM_RANDOM_SAMPLES);
+    assert_gpu_available();
 
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xCAFE);
     let fixture = get_fixture();
@@ -70,21 +85,11 @@ fn test_c_gap_random_sample_validation() {
             .expect("inner proof generation failed")
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_pvugc_setup_from_pk_for::<DefaultCycle, _>(
-            &pk_outer,
-            &fixture.vk_inner,
-            inner_proof_generator,
-        )
-    }));
-
-    let (pvugc_vk, lean_pk) = match result {
-        Ok(v) => v,
-        Err(_) => {
-            println!("PVUGC setup failed - test skipped");
-            return;
-        }
-    };
+    let (pvugc_vk, lean_pk) = build_pvugc_setup_from_pk_for::<DefaultCycle, _>(
+        &pk_outer,
+        &fixture.vk_inner,
+        inner_proof_generator,
+    );
 
     println!("Setup complete. T_const has {} basis points.", pvugc_vk.t_const_points_gt.len());
 
@@ -222,6 +227,7 @@ fn test_c_gap_random_sample_validation() {
 #[ignore]
 fn test_c_gap_edge_cases() {
     println!("\n=== C-Gap Edge Case Validation ===\n");
+    assert_gpu_available();
 
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xCAFE);
     let fixture = get_fixture();
@@ -268,21 +274,11 @@ fn test_c_gap_edge_cases() {
             .expect("inner proof generation failed")
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_pvugc_setup_from_pk_for::<DefaultCycle, _>(
-            &pk_outer,
-            &fixture.vk_inner,
-            inner_proof_generator,
-        )
-    }));
-
-    let (pvugc_vk, lean_pk) = match result {
-        Ok(v) => v,
-        Err(_) => {
-            println!("PVUGC setup failed - test skipped");
-            return;
-        }
-    };
+    let (pvugc_vk, lean_pk) = build_pvugc_setup_from_pk_for::<DefaultCycle, _>(
+        &pk_outer,
+        &fixture.vk_inner,
+        inner_proof_generator,
+    );
 
     let mut all_passed = true;
 
@@ -361,4 +357,3 @@ fn test_c_gap_edge_cases() {
 
     println!("\n✅ All edge case validations PASSED!");
 }
-
