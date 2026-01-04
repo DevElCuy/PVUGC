@@ -50,6 +50,7 @@ coverage/
 # Performance cache for Groth16 proving/verification keys
 inner_crs_pk_vk.bin
 outer_crs_*.bin
+outer_lean_setup_pk_vk_MNT4-298_MNT6-298.bin
 
 # CUDA debug and test files
 sppark-msm/src/test_field.cu
@@ -61,4 +62,3 @@ src/bin/extract_bw6_params.rs
 *.o
 tmp_build/
 tmp_target/
-
