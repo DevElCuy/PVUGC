@@ -159,7 +159,7 @@ cargo test test_one_sided_security -- --nocapture
 ### 5.3 Documentation Map
 
 - `docs/GPU_INDEX.md` - GPU/CUDA documentation tree and ordered reading path
-- `GPU_SUPPORT.md` - GPU build flags, supported curves, tests, troubleshooting
+- `GPU_SUPPORT.md` - GPU build flags, configuration, tests, troubleshooting
 - `GPU_plan.md` - prioritized GPU roadmap for SP1 + lean e2e
 - `docs/MNT_GPU_ACCELERATION.md` - MNT sparse quotient GPU integration details
 - `sppark-msm/docs/BW6_761_CGBN.md` - BW6-761 CGBN MSM kernel details

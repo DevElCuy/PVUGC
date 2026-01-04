@@ -226,25 +226,207 @@ harness = false
 
 | Component | MNT4-298 | MNT6-298 |
 |-----------|----------|----------|
-| CGBN kernel | Working | Working |
-| Field arithmetic | Working | Working |
-| Point doubling (a != 0) | Working | Working |
-| Scalar multiplication | Working | Working |
-| MSM accumulation | Working | Working |
-| Rust FFI | Working | Working |
-| Layout validation | Passing | Passing |
+| CGBN kernel | ✅ Working | ✅ Working |
+| Field arithmetic | ✅ Working | ✅ Working |
+| Point doubling (a != 0) | ✅ Working | ✅ Working |
+| Scalar multiplication | ✅ Working | ✅ Working |
+| MSM accumulation (serial) | ✅ Working | ✅ Working |
+| MSM Pippenger | ✅ Working | ✅ Working |
+| Rust FFI | ✅ Working | ✅ Working |
+| Layout validation | ✅ Passing | ✅ Passing |
+| GPU/CPU consistency | ✅ 21/21 passing | ✅ 21/21 passing |
+
+**Verified**: 2026-01-03
+
+### Implementation Approach (vs BW6-761)
+
+MNT curves use **standard multiplication** (`cgbn_mul_wide` + `cgbn_rem_wide`) instead of Montgomery multiplication. This:
+- Avoids the CGBN weak reduction bug that affected BW6-761
+- Returns fully reduced results in [0, P) from `cgbn_rem_wide`
+- May be slightly slower than Montgomery but is correctness-safe
+
+Detailed review and BW6-761 comparison below.
+
+---
+
+## Implementation Review (2026-01-03)
+
+### Summary
+
+Reviewed MNT4-298 and MNT6-298 CGBN implementations against the BW6-761 weak reduction bug findings. MNT uses standard multiplication (`cgbn_mul_wide` + `cgbn_rem_wide`), so the Montgomery weak-reduction issue does not apply. All GPU/CPU consistency tests pass for both curves (21/21).
+
+### BW6-761 Bug Recap
+
+Root cause: CGBN's `cgbn_mont_mul` returns values in [0, 2P) instead of [0, P). This can break field subtraction when inputs are >= P.
+
+Fix: Add explicit `if (r >= P) r -= P` after every `cgbn_mont_mul` call.
+
+### MNT4-298 Analysis
+
+#### Critical Difference: No Montgomery Form
+
+MNT4-298 uses **standard multiplication** instead of Montgomery:
+
+```cpp
+// MNT4-298 field_mul (lines 141-152)
+void field_mul(bn_t& r, const bn_t& a, const bn_t& b, const bn_t& P) {
+    typedef typename env_t::cgbn_wide_t wide_t;
+    wide_t product;
+    cgbn_mul_wide(_env, product, a, b);    // Full 640-bit product
+    cgbn_rem_wide(_env, r, product, P);    // Exact reduction
+}
+```
+
+vs BW6-761:
+
+```cpp
+// BW6-761 field_mul (uses Montgomery)
+void field_mul(bn_t& r, const bn_t& a, const bn_t& b, const bn_t& P) {
+    cgbn_mont_mul(_env, r, a, b, P, BW6_761_NP0);
+    // MUST add reduction here!
+    if (cgbn_compare(_env, r, P) >= 0) cgbn_sub(_env, r, r, P);
+}
+```
+
+**Result**: `cgbn_rem_wide` returns a fully reduced result in [0, P). The weak reduction bug does NOT affect MNT4-298's `field_mul`. MNT6-298 follows the same pattern.
+
+### Issue 1: `field_sub` Potential Aliasing Bug (MEDIUM RISK)
+
+**Location**: `sppark-msm/src/msm_mnt4_298_cgbn.cu` lines 123-130
+
+**Current code**:
+```cpp
+void field_sub(bn_t& r, const bn_t& a, const bn_t& b, const bn_t& P) {
+    int32_t borrow = cgbn_sub(_env, r, a, b);
+    if (borrow != 0) {
+        cgbn_add(_env, r, r, P);
+    }
+}
+```
+
+**Problem**: If `r` aliases `b`, then:
+1. `cgbn_sub(r, a, b)` computes `a - b` into `r`
+2. `b` (aliased to `r`) has been overwritten
+3. If borrow occurred, `cgbn_add(r, r, P)` adds P to the wrong value
+
+**Risk level**: Medium. Call sites appear safe today, but patterns like `field_sub(temp, temp, X3, P_mod)` could be problematic.
+
+**Recommended fix** (from BW6-761):
+```cpp
+void field_sub(bn_t& r, const bn_t& a, const bn_t& b, const bn_t& P) {
+    bn_t temp_result;
+    int32_t cmp = cgbn_compare(_env, a, b);
+    if (cmp >= 0) {
+        cgbn_sub(_env, temp_result, a, b);
+    } else {
+        bn_t p_minus_b;
+        cgbn_sub(_env, p_minus_b, P, b);
+        cgbn_add(_env, temp_result, a, p_minus_b);
+    }
+    cgbn_set(_env, r, temp_result);
+}
+```
+
+### Issue 2: `field_add` Uses Expensive `cgbn_rem` (LOW RISK, PERFORMANCE)
+
+**Location**: `sppark-msm/src/msm_mnt4_298_cgbn.cu` lines 110-114
+
+**Current code**:
+```cpp
+void field_add(bn_t& r, const bn_t& a, const bn_t& b, const bn_t& P) {
+    cgbn_add(_env, r, a, b);
+    cgbn_rem(_env, r, r, P);  // Full modular reduction (expensive!)
+}
+```
+
+**Issue**: `cgbn_rem` performs a full division. Since `a, b < P`, we have `a + b < 2P`, so a single conditional subtract is sufficient and faster.
+
+**Recommended optimization**:
+```cpp
+void field_add(bn_t& r, const bn_t& a, const bn_t& b, const bn_t& P) {
+    cgbn_add(_env, r, a, b);
+    if (cgbn_compare(_env, r, P) >= 0) {
+        cgbn_sub(_env, r, r, P);
+    }
+}
+```
+
+### Issue 3: `point_add_mixed` Y3 Calculation (LOW RISK)
+
+**Location**: `sppark-msm/src/msm_mnt4_298_cgbn.cu` lines 217-221
+
+BW6-761 fixed a potential aliasing issue in the Y3 calculation by using dedicated temp variables. MNT4-298 has the same pattern:
+
+```cpp
+// Current MNT4-298 code
+field_sub(temp, Q, X3, P_mod);
+field_mul(Y3, R, temp, P_mod);
+field_mul(temp, Y1, PPP, P_mod);
+field_sub(Y3, Y3, temp, P_mod);  // temp reused, but not aliased
+```
+
+This specific pattern is safe because `temp` is used as intermediate storage and never aliases inputs. For consistency with BW6-761 and defensive coding, consider using the clearer pattern.
+
+### Test Status
+
+All 21/21 GPU/CPU consistency tests pass for both curves (verified 2026-01-03).
+
+Run:
+```bash
+cargo test --release --features gpu --test test_mnt4_cpu_gpu_consistency -- --nocapture
+cargo test --release --features gpu --test test_mnt6_cpu_gpu_consistency -- --nocapture
+```
+
+### Comparison Table
+
+| Aspect | BW6-761 (fixed) | MNT4-298 (current) | MNT6-298 (current) |
+|--------|-----------------|--------------------|--------------------|
+| Field size | 768-bit | 320-bit | 320-bit |
+| `field_mul` | Montgomery + reduction | Wide mul + rem | Wide mul + rem |
+| Weak reduction risk | Fixed | None | None |
+| `field_sub` aliasing | Fixed | Theoretical (not triggered) | Theoretical (not triggered) |
+| `field_add` | Conditional sub | Full `cgbn_rem` | Full `cgbn_rem` |
+| Test coverage | 21/21 passing | 21/21 passing | 21/21 passing |
+
+### Recommended Actions
+
+#### ✅ Priority 1: Verify Current Tests Pass (DONE 2026-01-03)
+```bash
+cargo test --release --features gpu --test test_mnt4_cpu_gpu_consistency -- --nocapture
+cargo test --release --features gpu --test test_mnt6_cpu_gpu_consistency -- --nocapture
+```
+
+**Result**: All 21/21 tests pass for both curves. The theoretical aliasing issues are not triggered by current call patterns.
+
+#### Priority 2: Fix `field_sub` Aliasing (OPTIONAL - for defensive coding)
+
+Apply the BW6-761 pattern using temp variables and explicit comparison. Not required since tests pass.
+
+#### Priority 3: Performance Optimization (OPTIONAL)
+
+Replace `cgbn_rem` in `field_add` with conditional subtract. Low priority since current implementation is correct.
+
+### Notes
+
+1. **Why different approach?** MNT4/MNT6 are 298-bit fields (padded to 320-bit). Montgomery form is most beneficial for repeated multiplications (which MSM has). The choice of standard multiplication may have been:
+   - Simplicity (no need for R, R^2, NP0 constants)
+   - Correctness-first approach (avoid Montgomery pitfalls)
+   - Acceptable performance for 320-bit fields
+
+2. **Trade-off**: Standard multiplication + `cgbn_rem_wide` is likely slower than Montgomery multiplication, but avoids the weak reduction bug entirely. For production, consider converting to Montgomery if performance is critical.
+
+3. **MNT6-298**: Has identical structure to MNT4-298, so the same analysis applies.
 
 ---
 
 ## Priority Alignment (Lean e2e)
 
-Lean e2e uses the MNT4-298/MNT6-298 cycle (DefaultCycle). Kernel support exists
-for both curves, but two integration gaps remain:
+Lean e2e uses the MNT4-298/MNT6-298 cycle (DefaultCycle). Status:
 
-1. **MNT6 G1 MSM dispatch in the lean prover**: `msm_backend::msm_g1` only routes MNT4 today.
-2. **G2 MSM**: still CPU for MNT6 (no GPU kernel or dispatch).
+1. ✅ **MNT4 G1 MSM dispatch**: Working, 21/21 tests passing
+2. ✅ **MNT6 G1 MSM dispatch**: Working, 21/21 tests passing (added 2025-12-26)
+3. ❌ **G2 MSM**: Still CPU-only (no GPU kernel or dispatch)
 
-These items are covered in the ordered list in `GPU_plan.md`.
 See `docs/GPU_INDEX.md` for the full GPU documentation tree.
 
 ---

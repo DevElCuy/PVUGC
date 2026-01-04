@@ -19,7 +19,7 @@ SKIP_BW6=1 cargo build --features gpu --release
 
 - `docs/GPU_INDEX.md` - GPU documentation tree
 - `GPU_plan.md` - prioritized GPU roadmap (SP1 + lean e2e)
-- `GPU_SUPPORT.md` - build flags and supported curves
+- `GPU_SUPPORT.md` - build flags, configuration, tests
 
 ---
 

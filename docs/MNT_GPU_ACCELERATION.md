@@ -1,5 +1,7 @@
 # MNT4/MNT6-298 GPU Acceleration
 
+**Last Updated**: 2026-01-03
+
 ## Overview
 
 This document covers the GPU acceleration strategy for MNT4-298 and MNT6-298 curves, including:
@@ -9,12 +11,12 @@ This document covers the GPU acceleration strategy for MNT4-298 and MNT6-298 cur
 
 ## Priority Alignment (Lean e2e)
 
-Lean e2e uses the MNT4-298/MNT6-298 cycle (DefaultCycle). Within that scope,
-the highest-impact pending items are:
+Lean e2e uses the MNT4-298/MNT6-298 cycle (DefaultCycle). Status:
 
-- **MNT6 G1 MSM dispatch in the lean prover** (`msm_backend::msm_g1` still routes only MNT4).
-- **Pippenger MSM for CGBN kernels** (replace serial double-and-add).
-- **G2 MSM** remains CPU-only (optional, lower impact).
+- ✅ **MNT4 G1 MSM dispatch**: Working, 21/21 tests passing (verified 2026-01-03)
+- ✅ **MNT6 G1 MSM dispatch**: Working, 21/21 tests passing (verified 2026-01-03)
+- ✅ **Pippenger MSM for CGBN kernels**: Implemented for both curves (2026-01-01)
+- ❌ **G2 MSM**: Still CPU-only (optional, lower impact)
 
 SP1 e2e uses the BLS12-377/BW6-761 cycle; the top missing item there is the BW6
 sparse-quotient GPU path (see `GPU_plan.md`).
@@ -355,13 +357,14 @@ cargo test --features gpu test_lean_prover_end_to_end -- --ignored --nocapture
 |-----------|------|-------|--------|
 | MNT4-298 CUDA Field Tests | `test_cgbn_mnt4_field.cu` | 100/100 | ✅ DONE |
 | MNT6-298 CUDA Field Tests | `test_cgbn_mnt6_field.cu` | 100/100 | ✅ DONE |
-| MNT4-298 CPU/GPU Consistency | `test_mnt4_cpu_gpu_consistency.rs` | 21/21 | ✅ DONE |
-| MNT6-298 CPU/GPU Consistency | `test_mnt6_cpu_gpu_consistency.rs` | 21/21 | ✅ DONE |
+| MNT4-298 CPU/GPU Consistency | `test_mnt4_cpu_gpu_consistency.rs` | 21/21 | ✅ DONE (verified 2026-01-03) |
+| MNT6-298 CPU/GPU Consistency | `test_mnt6_cpu_gpu_consistency.rs` | 21/21 | ✅ DONE (verified 2026-01-03) |
 | Sparse Quotient GPU Tests | `test_sparse_quotient_gpu.rs` | 19/19 | ✅ DONE |
 | MSM GPU Integration | `src/pvugc_outer.rs` | - | ✅ DONE |
 | Sparse Quotient Kernel | `sparse_quotient_mnt4_298_cgbn.cu` | - | ✅ DONE |
 | Sparse Quotient GPU Integration | `src/pvugc_outer.rs` | - | ✅ DONE |
 | GPU/CPU Integration Tests | `src/pvugc_outer.rs` | 4/4 | ✅ DONE |
+| Pippenger MSM (MNT4/MNT6) | `msm_mnt*_cgbn.cu` | - | ✅ DONE (2026-01-01) |
 
 ### Integration Status
 
@@ -439,7 +442,8 @@ GPU test code uses `ManuallyDrop` to prevent Rust from dropping CUDA memory duri
 1. **MNT6 sparse quotient wrapper:** CUDA kernel exists for MNT6, but Rust FFI wraps the MNT4 variant today. Confirm if a dedicated MNT6 wrapper is needed.
 2. **Batch size:** GPU uses larger batch size than CPU; tune based on memory/throughput.
 3. **Error handling:** Decide whether GPU failures fall back to CPU mid-run or fail fast.
-4. **Lean prover dispatch:** Add MNT6 GPU routing in `msm_backend::msm_g1` to avoid CPU MSM in lean e2e.
+
+> **Resolved:** MNT6 GPU routing added to `msm_backend::msm_g1` (2025-12-26). Lean prover now uses GPU for MNT6-298 G1 MSM.
 
 ---
 
@@ -457,6 +461,11 @@ GPU test code uses `ManuallyDrop` to prevent Rust from dropping CUDA memory duri
 - Domain element tables: ~10 MB
 - Output coefficients: ~2 GB (temporary)
 - GPU memory needed: ~4 GB minimum
+
+### Dynamic GPU Memory Configuration
+
+Batch size is computed from available GPU memory using `GPU_MEMORY_PERCENT` (default 80%).
+See `GPU_SUPPORT.md` for configuration details, examples, and fallback behavior.
 
 ---
 

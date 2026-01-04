@@ -21,9 +21,11 @@ This constrains which optimizations are viable to develop and test:
 ## Status Snapshot
 
 - **BLS12-377 G1 MSM**: Production via sppark (tests passing).
-- **BW6-761 G1 MSM**: CGBN kernel integrated; gated by `ENABLE_CGBN_STUB=1`.
-- **MNT4-298 / MNT6-298 G1 MSM + sparse quotient**: GPU path integrated for PVUGC.
-- **GPU/CPU Integration Tests**: 4 tests passing, verifying H_ij bases match between paths.
+- **BW6-761 G1 MSM**: CGBN kernel integrated; 21/21 tests passing (weak reduction bug fixed 2026-01-03).
+- **MNT4-298 G1 MSM**: CGBN kernel integrated; 21/21 tests passing (verified 2026-01-03).
+- **MNT6-298 G1 MSM**: CGBN kernel integrated; 21/21 tests passing (verified 2026-01-03).
+- **Sparse quotient (MNT)**: GPU path integrated for PVUGC, 4 integration tests passing.
+- **Sparse quotient (BW6)**: Kernel added with build availability check (`sparse_quotient_bw6_available`); PVUGC integration still pending.
 
 ## Priority Scopes (Tests)
 
@@ -45,10 +47,10 @@ Priority now considers what's viable on current 6GB hardware:
 
 ### Tier 1: Viable Now (6GB GPU)
 
-1. **MNT6 G1 MSM dispatch in lean prover** ⬅️ Quick win
+1. **MNT6 G1 MSM dispatch in lean prover** ✅ Done
    - Work: Add MNT6-298 branch in `msm_backend::msm_g1` (kernel exists, just routing).
    - Est gain: **~2–8x** on MNT6 MSM steps in lean prover.
-   - Status: ❌ Not started
+   - Status: ✅ Completed (2025-12-26) - added dispatch in `src/msm_backend.rs:66-73`
 
 2. **Pippenger MSM for CGBN kernels (BW6/MNT)** ✅ DONE
    - Work: Replace serial double-and-add with Pippenger in CGBN kernels.
@@ -61,7 +63,7 @@ Priority now considers what's viable on current 6GB hardware:
    - Work: BW6 kernels + FFI + integration in `compute_witness_bases()` for `Bls12Bw6Cycle`.
    - Est gain: **~10–30x** on quotient coefficient phase; **~3–10x overall** SP1 e2e.
    - Memory: ~4GB with batching (tight on 6GB, needs careful batch sizing like MNT).
-   - Status: ❌ Not started
+   - Status: 🟡 Kernel + build check landed; integration + validation still pending
 
 ### Tier 2: Needs Larger GPU (8GB+)
 
@@ -80,7 +82,6 @@ Priority now considers what's viable on current 6GB hardware:
 ### Validation Gates (Non-Perf, but Required)
 
 - Benchmark GPU vs CPU for BW6/MNT MSM + sparse quotient.
-- Remove `ENABLE_CGBN_STUB` gate after correctness validation.
 - End-to-end SP1 + lean e2e runs with GPU path.
 - Apple Metal feasibility (future work).
 
@@ -103,10 +104,12 @@ Priority now considers what's viable on current 6GB hardware:
 | 2025-12-25 | Phase 4 integration tests verified | 4 tests passing: GPU/CPU consistency, determinism, edge cases |
 | 2025-12-25 | Fixed CGBN duplicate symbol linker error | Added `--allow-multiple-definition` to `.cargo/config.toml` |
 | 2025-12-25 | Added `-fvisibility=hidden` to CGBN builds | Reduces symbol conflicts in multi-kernel builds |
+| 2025-12-26 | MNT6 G1 MSM dispatch added to msm_backend | Lean prover now uses GPU for MNT6-298 G1 MSM |
 | 2026-01-01 | Pippenger MSM implemented for all CGBN curves | BW6-761, MNT4-298, MNT6-298 all have Pippenger kernels |
 | 2026-01-01 | BW6-761 debugging session completed | Found CPU reference bug (aliasing in gmp_field_sub), GPU code was correct |
 | 2026-01-01 | Codebase cleanup | Removed ~1500 lines of debug code, kept bug fixes (R2 constant, field_sub, point_add_mixed) |
 | 2026-01-03 | BW6-761 CGBN weak reduction bug fixed | Root cause: `cgbn_mont_mul` returns [0,2P), not [0,P). Fix: add `if (r >= P) r -= P` after each Mont mul. All 21/21 tests now pass. |
+| 2026-01-03 | MNT4/MNT6 GPU implementation verified | Reviewed against BW6-761 learnings. MNT uses standard mul (not Montgomery) so weak reduction bug doesn't apply. All 21/21 tests pass for both curves. |
 
 ## Debugging Learnings (2026-01-01 + 2026-01-03)
 
@@ -120,14 +123,15 @@ During BW6-761 debugging, key learnings:
 
 4. **XYZZ coordinate conversion**: When comparing GPU results against arkworks, remember GPU uses XYZZ coordinates. Convert properly: `x_affine = X/ZZ`, `y_affine = Y/ZZZ`.
 
-5. **CGBN weak Montgomery reduction (2026-01-03)**: CGBN's `cgbn_mont_mul` returns values in [0, 2P) instead of fully reduced [0, P). This is documented in CGBN issue #15. Fix: add explicit `if (r >= P) r -= P` after every `cgbn_mont_mul` call. See `sppark-msm/docs/research-brief-cgbn-bw6-761-RESULTS.md` for full analysis.
+5. **CGBN weak Montgomery reduction (2026-01-03)**: CGBN's `cgbn_mont_mul` returns values in [0, 2P) instead of fully reduced [0, P). This is documented in CGBN issue #15. Fix: add explicit `if (r >= P) r -= P` after every `cgbn_mont_mul` call. See `sppark-msm/docs/BW6_761_CGBN_BUG_SUMMARY.md` for full analysis.
+
+6. **MNT4/MNT6 use different approach (2026-01-03)**: MNT curves use `cgbn_mul_wide` + `cgbn_rem_wide` (standard multiplication) instead of Montgomery. This avoids the weak reduction bug entirely since `cgbn_rem_wide` returns fully reduced results in [0, P). See `sppark-msm/docs/MNT_CGBN.md` for analysis.
 
 ## Open Questions
 
 1. ~~When should Pippenger replace serial double-and-add for CGBN kernels?~~ ✅ Done - Pippenger implemented for all curves
 2. What is the target benchmark threshold to keep GPU enabled by default?
-3. ~~When is it safe to remove the `ENABLE_CGBN_STUB` gate?~~ ✅ Safe now - BW6-761 bug fixed (2026-01-03)
-4. How important is Apple Metal support vs CUDA-only for the roadmap?
+3. How important is Apple Metal support vs CUDA-only for the roadmap?
 
 ## Success Metrics
 
