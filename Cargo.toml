@@ -26,6 +26,8 @@ asm = [
 # Use production SP1 Groth16 VK (from sp1-keys/production/)
 # Without this, uses empty placeholder (for dev before keys are generated)
 sp1-production-vk = []
+# Use BLS12-377/BW6-761 cycle instead of MNT4-298/MNT6-298 (~128-bit vs ~100-bit security)
+bw6-cycle = []
 
 [dependencies]
 sppark-msm = { path = "sppark-msm", optional = true }

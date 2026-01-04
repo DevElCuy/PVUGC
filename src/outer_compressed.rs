@@ -86,7 +86,14 @@ pub mod cycles {
 pub use cycles::{Bls12Bw6Cycle, Mnt4Mnt6Cycle};
 
 /// Default cycle used across the crate unless otherwise specified.
+///
+/// - Default: MNT4-298/MNT6-298 (~100-bit security, faster for development)
+/// - With `--features bw6-cycle`: BLS12-377/BW6-761 (~128-bit security, production)
+#[cfg(not(feature = "bw6-cycle"))]
 pub type DefaultCycle = Mnt4Mnt6Cycle;
+
+#[cfg(feature = "bw6-cycle")]
+pub type DefaultCycle = Bls12Bw6Cycle;
 
 /// Convenience aliases for the default recursion cycle.
 pub type InnerE = <DefaultCycle as RecursionCycle>::InnerE;
@@ -159,6 +166,40 @@ impl<C: RecursionCycle> ConstraintSynthesizer<OuterScalar<C>> for OuterCircuit<C
         use ark_relations::r1cs::{LinearCombination, Variable};
         use ark_ff::One;
 
+        // TRIVIAL_TEST_CIRCUIT: Ultra-minimal circuit for GPU kernel stress testing.
+        // Creates only ~10 constraints instead of ~31K, reducing pairs from ~680M to ~100.
+        // Use this when you need to test GPU kernel correctness without waiting hours.
+        let trivial_circuit = std::env::var("TRIVIAL_TEST_CIRCUIT").is_ok();
+
+        if trivial_circuit {
+            use std::sync::Once;
+            static WARN_ONCE_TRIVIAL: Once = Once::new();
+            WARN_ONCE_TRIVIAL.call_once(|| {
+                eprintln!("\n{}", "=".repeat(80));
+                eprintln!("WARNING: TRIVIAL_TEST_CIRCUIT is set!");
+                eprintln!("Using MINIMAL circuit (~10 constraints) for GPU kernel testing.");
+                eprintln!("This provides NO CRYPTOGRAPHIC FUNCTIONALITY whatsoever.");
+                eprintln!("Use ONLY for GPU kernel correctness and performance testing.");
+                eprintln!("{}\n", "=".repeat(80));
+            });
+
+            // Minimal circuit: just allocate public inputs and a trivial constraint
+            let one_lc = LinearCombination::from((OuterScalar::<C>::one(), Variable::One));
+            for x_val in &self.x_inner {
+                let x_outer: OuterScalar<C> = convert_inner_to_outer::<C>(*x_val);
+                let x_pub = cs.new_input_variable(|| Ok(x_outer))?;
+                let x_wit = cs.new_witness_variable(|| Ok(x_outer))?;
+
+                // Single constraint: 1 * x_wit = x_pub
+                let mut lc_b = LinearCombination::<OuterScalar<C>>::zero();
+                lc_b += (OuterScalar::<C>::one(), x_wit);
+                let mut lc_c = LinearCombination::<OuterScalar<C>>::zero();
+                lc_c += (OuterScalar::<C>::one(), x_pub);
+                cs.enforce_constraint(one_lc.clone(), lc_b, lc_c)?;
+            }
+            return Ok(());
+        }
+
         // SECURE SPAN-SEPARATED PUBLIC INPUT BINDING
         //
         // Goal:
@@ -175,9 +216,9 @@ impl<C: RecursionCycle> ConstraintSynthesizer<OuterScalar<C>> for OuterCircuit<C
         // This ensures only ONE witness column (x_wit) touches the public-C row,
         // and we can omit the corresponding (0, x_wit) quotient basis from the
         // published Lean CRS and bake it via the standard–lean C-gap machinery.
-        
+
         let one_lc = LinearCombination::from((OuterScalar::<C>::one(), Variable::One));
-        
+
         // Step 1: Allocate public inputs x_pub and corresponding witness scalars x_wit.
         // We keep the outer-field value around so both allocations are consistent.
         let mut x_pub_vars = Vec::new();
@@ -189,7 +230,7 @@ impl<C: RecursionCycle> ConstraintSynthesizer<OuterScalar<C>> for OuterCircuit<C
             x_pub_vars.push(x_pub);
             x_wit_vars.push(x_wit);
         }
-        
+
         // Step 2: BooleanInputVar as WITNESS (for verifier's scalar multiplication).
         let input_var =
             BooleanInputVar::<InnerScalar<C>, OuterScalar<C>>::new_witness(cs.clone(), || {
@@ -208,7 +249,7 @@ impl<C: RecursionCycle> ConstraintSynthesizer<OuterScalar<C>> for OuterCircuit<C
             // Build linear combination: sum of bit_i * 2^i
             let mut reconstructed_lc = LinearCombination::<OuterScalar<C>>::zero();
             let mut power_of_two = OuterScalar::<C>::one();
-            
+
             for bit in &bits {
                 // bit.lc() gives the linear combination for this boolean
                 let bit_lc = bit.lc();
@@ -218,7 +259,7 @@ impl<C: RecursionCycle> ConstraintSynthesizer<OuterScalar<C>> for OuterCircuit<C
                 }
                 power_of_two = power_of_two + power_of_two;
             }
-            
+
             // 3a) Enforce: 1 * reconstructed(bits) = x_wit  (witness-only row)
             let mut lc_c_wit = LinearCombination::<OuterScalar<C>>::zero();
             lc_c_wit += (OuterScalar::<C>::one(), *x_wit);
@@ -231,16 +272,48 @@ impl<C: RecursionCycle> ConstraintSynthesizer<OuterScalar<C>> for OuterCircuit<C
             lc_c_pub += (OuterScalar::<C>::one(), *x_pub);
             cs.enforce_constraint(one_lc.clone(), lc_b, lc_c_pub)?;
         }
-        
-        // Step 4: Use witness input_var in verifier (now bound to x_pub!)
-        let proof_var = ProofVar::<C::InnerE, C::InnerPairingVar>::new_witness(cs.clone(), || {
-            Ok(self.proof_inner)
-        })?;
 
-        let ok = Groth16VerifierGadget::<C::InnerE, C::InnerPairingVar>::verify(
-            &vk_var, &input_var, &proof_var,
-        )?;
-        ok.enforce_equal(&Boolean::TRUE)?;
+        // Step 4: Use witness input_var in verifier (now bound to x_pub!)
+        //
+        // SKIP_VERIFIER_GADGET: Environment variable to skip the expensive Groth16 verifier
+        // gadget (~17K constraints) for faster testing. Still keeps bit decomposition (~14K).
+        //
+        // WARNING: This removes cryptographic security! The resulting circuit only
+        // enforces public input binding, not proof verification. Use ONLY for:
+        // - GPU kernel correctness testing (sparse quotient, MSM)
+        // - CRS generation pipeline debugging
+        // - Development iteration on non-security-critical code paths
+        //
+        // NEVER use in production or when testing PVUGC security properties.
+        let skip_verifier = std::env::var("SKIP_VERIFIER_GADGET").is_ok();
+
+        if skip_verifier {
+            use std::sync::Once;
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                eprintln!("\n{}", "=".repeat(80));
+                eprintln!("WARNING: SKIP_VERIFIER_GADGET is set!");
+                eprintln!("The Groth16 verifier gadget is DISABLED. This circuit provides");
+                eprintln!("NO CRYPTOGRAPHIC SECURITY - it only enforces public input binding.");
+                eprintln!("Use only for GPU kernel testing and development iteration.");
+                eprintln!("{}\n", "=".repeat(80));
+            });
+            // Allocate proof_var as witness but skip verification
+            let _proof_var = ProofVar::<C::InnerE, C::InnerPairingVar>::new_witness(cs.clone(), || {
+                Ok(self.proof_inner)
+            })?;
+            // No verification constraint - circuit is trivially satisfiable
+        } else {
+            let proof_var = ProofVar::<C::InnerE, C::InnerPairingVar>::new_witness(cs.clone(), || {
+                Ok(self.proof_inner)
+            })?;
+
+            let ok = Groth16VerifierGadget::<C::InnerE, C::InnerPairingVar>::verify(
+                &vk_var, &input_var, &proof_var,
+            )?;
+            ok.enforce_equal(&Boolean::TRUE)?;
+        }
+
         Ok(())
     }
 }
