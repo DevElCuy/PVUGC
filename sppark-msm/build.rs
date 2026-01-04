@@ -55,6 +55,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/msm_mnt6_298_cgbn.cu");
     println!("cargo:rerun-if-changed=src/sparse_quotient_mnt4_298_cgbn.cu");
     println!("cargo:rerun-if-changed=src/sparse_quotient_mnt6_298_cgbn.cu");
+    println!("cargo:rerun-if-changed=src/sparse_quotient_bw6_761_cgbn.cu");
     println!("cargo:rerun-if-changed=sppark");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
@@ -67,6 +68,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(mnt6_cgbn_available)");
     println!("cargo::rustc-check-cfg=cfg(sparse_quotient_mnt4_available)");
     println!("cargo::rustc-check-cfg=cfg(sparse_quotient_mnt6_available)");
+    println!("cargo::rustc-check-cfg=cfg(sparse_quotient_bw6_available)");
 
     if std::env::var("CARGO_FEATURE_GPU").is_err() {
         println!("cargo:warning=CUDA build skipped (feature \"gpu\" not enabled)");
@@ -92,6 +94,7 @@ fn main() {
     let mnt6_available = AtomicBool::new(false);
     let sparse_mnt4_available = AtomicBool::new(false);
     let sparse_mnt6_available = AtomicBool::new(false);
+    let sparse_bw6_available = AtomicBool::new(false);
 
     // By default, compile kernels sequentially to reduce memory pressure
     // Set CUDA_PARALLEL=1 to enable parallel compilation (requires more RAM)
@@ -267,6 +270,38 @@ fn main() {
         build.try_compile("sparse_quotient_mnt6_cgbn").is_ok()
     };
 
+    let build_sparse_bw6 = || {
+        let mut build = cc::Build::new();
+        build
+            .cuda(true)
+            .flag("-std=c++17")
+            .flag("-allow-unsupported-compiler")
+            .flag(&arch_flag)
+            .flag("-rdc=true")
+            .flag("-Xcompiler").flag("-O3")
+            .flag("-Xcompiler").flag("-Wno-unknown-pragmas")
+            .flag("-Xcompiler").flag("-Wno-maybe-uninitialized")
+            .flag("-Xcompiler").flag("-fvisibility=hidden")
+            .flag("--maxrregcount=128")
+            .define("XMP_IMAD", None)
+            .flag("-Xptxas=-O1");
+
+        if cuda_verbose {
+            build.flag("--ptxas-options=-v");
+        }
+
+        build
+            .include("sppark")
+            .include("sppark/blst/src")
+            .include(&cuda_include)
+            .include(cgbn_include)
+            .include("/usr/include")
+            .include("/usr/include/x86_64-linux-gnu")
+            .file("src/sparse_quotient_bw6_761_cgbn.cu");
+
+        build.try_compile("sparse_quotient_bw6_cgbn").is_ok()
+    };
+
     if cuda_parallel {
         // Parallel compilation (requires more RAM - 64GB+ recommended)
         println!("cargo:warning=Starting PARALLEL CUDA kernel compilation (CUDA_PARALLEL=1)...");
@@ -282,6 +317,11 @@ fn main() {
             let mnt6_handle = s.spawn(build_mnt6);
             let sparse_mnt4_handle = s.spawn(build_sparse_mnt4);
             let sparse_mnt6_handle = s.spawn(build_sparse_mnt6);
+            let sparse_bw6_handle = if skip_bw6 {
+                None
+            } else {
+                Some(s.spawn(build_sparse_bw6))
+            };
 
             // Wait for all threads and store results
             if let Some(handle) = bw6_handle {
@@ -291,6 +331,9 @@ fn main() {
             mnt6_available.store(mnt6_handle.join().unwrap_or(false), Ordering::SeqCst);
             sparse_mnt4_available.store(sparse_mnt4_handle.join().unwrap_or(false), Ordering::SeqCst);
             sparse_mnt6_available.store(sparse_mnt6_handle.join().unwrap_or(false), Ordering::SeqCst);
+            if let Some(handle) = sparse_bw6_handle {
+                sparse_bw6_available.store(handle.join().unwrap_or(false), Ordering::SeqCst);
+            }
         });
     } else {
         // Sequential compilation (default - reduces memory pressure)
@@ -314,6 +357,13 @@ fn main() {
 
         println!("cargo:warning=Compiling Sparse Quotient MNT6-298 kernel...");
         sparse_mnt6_available.store(build_sparse_mnt6(), Ordering::SeqCst);
+
+        if skip_bw6 {
+            println!("cargo:warning=Skipping Sparse Quotient BW6-761 kernel (SKIP_BW6=1)");
+        } else {
+            println!("cargo:warning=Compiling Sparse Quotient BW6-761 kernel...");
+            sparse_bw6_available.store(build_sparse_bw6(), Ordering::SeqCst);
+        }
     }
 
     // Report CGBN kernel availability
@@ -351,6 +401,13 @@ fn main() {
         println!("cargo:warning=Sparse Quotient MNT6-298: AVAILABLE");
     } else {
         println!("cargo:warning=Sparse Quotient MNT6-298: NOT AVAILABLE");
+    }
+
+    if sparse_bw6_available.load(Ordering::SeqCst) {
+        println!("cargo:rustc-cfg=sparse_quotient_bw6_available");
+        println!("cargo:warning=Sparse Quotient BW6-761: AVAILABLE (TPI=8, BITS=384)");
+    } else {
+        println!("cargo:warning=Sparse Quotient BW6-761: NOT AVAILABLE");
     }
 
     // Build BLS12-377 kernel (required for base functionality)
