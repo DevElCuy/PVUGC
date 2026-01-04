@@ -11,6 +11,10 @@ tests/test_cgbn_point_add
 tests/test_cgbn_bw6_field
 tests/test_cgbn_mnt4_field
 tests/test_cgbn_mnt6_field
+tests/test_bw6_scalar_mul
+tests/test_bw6_field_ops
+tests/test_bw6_point_ops
+tests/test_probe_bit
 
 # Valgrind core dumps
 vgcore.*
