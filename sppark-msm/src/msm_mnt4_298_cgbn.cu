@@ -916,3 +916,840 @@ cleanup_error:
     cgbn_error_report_free(d_report);
     return MNT4_MSM_ERROR_CUDA_RUNTIME;
 }
+
+// ============================================================================
+// PIPPENGER MSM IMPLEMENTATION
+// ============================================================================
+//
+// Pippenger's bucket method for MSM with CGBN field arithmetic.
+// Algorithm phases:
+// 1. Breakdown: Partition scalars into signed wbits-wide digits
+// 2. Histogram: Count points per bucket for memory allocation
+// 3. Sort: Group point indices by bucket assignment
+// 4. Accumulate: Add points to buckets (parallel, one CGBN instance per bucket)
+// 5. Integrate: Horner-like bucket sum within each window
+// 6. Combine: Merge window results with doublings
+//
+// Complexity: O(n + nwins * 2^(wbits-1)) vs O(n * scalar_bits) for serial
+// ============================================================================
+
+// Pippenger configuration
+#define PIPPENGER_MIN_WBITS 8
+#define PIPPENGER_MAX_WBITS 16
+#define PIPPENGER_SCALAR_BITS 298
+
+// Helper: Compute optimal window size based on point count
+__host__ __device__ __forceinline__
+uint32_t compute_optimal_wbits(uint32_t n) {
+    if (n == 0) return PIPPENGER_MIN_WBITS;
+
+    // wbits ~ log2(n) - 1, clamped to [MIN_WBITS, MAX_WBITS]
+    uint32_t log2_n = 0;
+    uint32_t temp = n;
+    while (temp > 1) { temp >>= 1; log2_n++; }
+
+    int32_t wbits = (int32_t)log2_n - 1;
+    if (wbits < PIPPENGER_MIN_WBITS) wbits = PIPPENGER_MIN_WBITS;
+    if (wbits > PIPPENGER_MAX_WBITS) wbits = PIPPENGER_MAX_WBITS;
+
+    return (uint32_t)wbits;
+}
+
+// Helper: Compute number of windows for given scalar bits and window size
+__host__ __device__ __forceinline__
+uint32_t compute_nwins(uint32_t scalar_bits, uint32_t wbits) {
+    return (scalar_bits + wbits - 1) / wbits;
+}
+
+// XYZZ bucket with infinity flag for Pippenger
+typedef struct {
+    uint32_t x[10];
+    uint32_t y[10];
+    uint32_t zz[10];
+    uint32_t zzz[10];
+    bool is_infinity;
+    uint8_t _padding[7];  // Align to 8 bytes
+} __align__(8) bucket_xyzz_t;
+
+// ============================================================================
+// KERNEL 1: Scalar Breakdown (extract signed digits)
+// ============================================================================
+//
+// Each thread processes one scalar, extracting nwins digits of wbits width.
+// Uses Booth encoding to produce signed digits in range [-2^(wbits-1), 2^(wbits-1)]
+// which halves the number of buckets needed.
+//
+// Output format per digit (32-bit):
+//   bits [0:15]  = bucket index (unsigned, 0 means skip)
+//   bit  [31]    = sign (0=positive, 1=negative)
+//
+__global__ void breakdown_scalars_mnt4_298(
+    uint32_t* digits,           // Output: [n * nwins] packed digits
+    const scalar_cgbn_t* scalars,
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const uint32_t* scalar = scalars[idx].limbs;
+    const uint32_t wmask = (1u << wbits) - 1;
+    const uint32_t half_buckets = 1u << (wbits - 1);
+
+    // Track carry for Booth encoding across windows
+    uint32_t carry = 0;
+
+    for (uint32_t win = 0; win < nwins; win++) {
+        uint32_t bit_offset = win * wbits;
+        uint32_t limb_idx = bit_offset / 32;
+        uint32_t bit_idx = bit_offset % 32;
+
+        // Extract wbits from scalar (may span two limbs)
+        uint64_t window_val = 0;
+        if (limb_idx < 10) {
+            window_val = scalar[limb_idx];
+        }
+        if (limb_idx + 1 < 10 && bit_idx + wbits > 32) {
+            window_val |= ((uint64_t)scalar[limb_idx + 1]) << 32;
+        }
+        window_val = (window_val >> bit_idx) & wmask;
+
+        // Add carry from previous window's Booth encoding
+        window_val += carry;
+        carry = 0;
+
+        // Booth encoding: if value > half_buckets, subtract 2^wbits and carry 1
+        // Note: we use > (not >=) because half_buckets can be represented directly
+        // For wbits=8: values 0-128 stay positive, 129-255 become negative
+        uint32_t sign = 0;
+        if (window_val > half_buckets) {
+            // Negative representation: bucket = 2^wbits - window_val
+            window_val = (1u << wbits) - window_val;
+            sign = 1;
+            carry = 1;  // Carry to next window
+        }
+
+        // Store packed digit: bucket_id in low 16 bits, sign in bit 31
+        // Note: bucket_id 0 means identity (skip this point for this window)
+        uint32_t packed = (uint32_t)window_val | (sign << 31);
+        digits[win * n + idx] = packed;
+    }
+}
+
+// ============================================================================
+// KERNEL 2: Histogram (count points per bucket)
+// ============================================================================
+//
+// Count how many points go to each bucket for memory allocation and sorting.
+// Uses atomicAdd for thread-safe counting.
+//
+__global__ void histogram_buckets_mnt4_298(
+    uint32_t* histogram,        // Output: [nwins * num_buckets] counts
+    const uint32_t* digits,     // Input: [n * nwins] packed digits
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    // +1 for bucket 2^(wbits-1) which can occur in Booth encoding
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+
+    for (uint32_t win = 0; win < nwins; win++) {
+        uint32_t packed = digits[win * n + idx];
+        // Bucket_id is in low 16 bits (sign is in bit 31)
+        uint32_t bucket_id = packed & 0xFFFF;
+
+        // Skip bucket 0 (identity, no contribution)
+        if (bucket_id > 0) {
+            uint32_t hist_idx = win * num_buckets + bucket_id;
+            atomicAdd(&histogram[hist_idx], 1);
+        }
+    }
+}
+
+// ============================================================================
+// KERNEL 3: Prefix Sum (compute bucket offsets from histogram)
+// ============================================================================
+//
+// Convert histogram counts to cumulative offsets for scatter phase.
+// Simple serial prefix sum per window (efficient for moderate bucket counts).
+//
+__global__ void prefix_sum_histogram_mnt4_298(
+    uint32_t* offsets,          // Output: [nwins * num_buckets] offsets
+    const uint32_t* histogram,  // Input: [nwins * num_buckets] counts
+    uint32_t nwins,
+    uint32_t num_buckets
+) {
+    uint32_t win = blockIdx.x * blockDim.x + threadIdx.x;
+    if (win >= nwins) return;
+
+    uint32_t base = win * num_buckets;
+    uint32_t sum = 0;
+
+    for (uint32_t b = 0; b < num_buckets; b++) {
+        uint32_t count = histogram[base + b];
+        offsets[base + b] = sum;
+        sum += count;
+    }
+}
+
+// ============================================================================
+// KERNEL 4: Scatter (sort point indices into bucket order)
+// ============================================================================
+//
+// Place point indices into their bucket positions using atomicAdd for
+// thread-safe scatter. Each point is placed once per window.
+//
+__global__ void scatter_to_buckets_mnt4_298(
+    uint32_t* sorted_indices,   // Output: [nwins * n] sorted point indices
+    uint32_t* bucket_counters,  // Working: [nwins * num_buckets] current counts
+    const uint32_t* offsets,    // Input: [nwins * num_buckets] bucket offsets
+    const uint32_t* digits,     // Input: [n * nwins] packed digits
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    // +1 for bucket 2^(wbits-1) which can occur in Booth encoding
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+
+    for (uint32_t win = 0; win < nwins; win++) {
+        uint32_t packed = digits[win * n + idx];
+        // Bucket_id is in low 16 bits, sign is in bit 31
+        uint32_t bucket_id = packed & 0xFFFF;
+        uint32_t sign = (packed >> 31) & 1;
+
+        // Skip bucket 0 (identity)
+        if (bucket_id > 0) {
+            uint32_t hist_idx = win * num_buckets + bucket_id;
+            uint32_t pos = offsets[hist_idx] + atomicAdd(&bucket_counters[hist_idx], 1);
+
+            // Pack point index with sign: idx | (sign << 31)
+            sorted_indices[win * n + pos] = idx | (sign << 31);
+        }
+    }
+}
+
+// ============================================================================
+// KERNEL 5: Bucket Accumulation (parallel bucket addition with CGBN)
+// ============================================================================
+//
+// Each CGBN instance (TPI=8 threads) processes one bucket.
+// Iterates through all points assigned to the bucket and accumulates them.
+//
+template<class params>
+__global__ void accumulate_buckets_mnt4_298(
+    cgbn_error_report_t* report,
+    bucket_xyzz_t* buckets,         // Output: [nwins * num_buckets]
+    const affine_cgbn_t* points,    // Input: [n] points
+    const uint32_t* sorted_indices, // Input: [nwins * n] sorted indices
+    const uint32_t* offsets,        // Input: [nwins * num_buckets] offsets
+    const uint32_t* histogram,      // Input: [nwins * num_buckets] counts
+    uint32_t n,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    // Each CGBN instance handles one bucket
+    int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / params::TPI;
+
+    // +1 for bucket 2^(wbits-1) which can occur in Booth encoding
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+    uint32_t total_buckets = nwins * num_buckets;
+
+    if ((uint32_t)instance >= total_buckets) return;
+
+    uint32_t win = instance / num_buckets;
+    uint32_t bucket_id = instance % num_buckets;
+
+    // Skip bucket 0 (identity bucket, always empty by design)
+    if (bucket_id == 0) {
+        buckets[instance].is_infinity = true;
+        return;
+    }
+
+    // Get bucket range from histogram
+    uint32_t hist_idx = win * num_buckets + bucket_id;
+    uint32_t start = offsets[hist_idx];
+    uint32_t count = histogram[hist_idx];
+
+    // Initialize CGBN
+    mnt4_msm_t<params> msm(cgbn_report_monitor, report, instance);
+    typename mnt4_msm_t<params>::bn_t P, px, py;
+    typename mnt4_msm_t<params>::bn_t acc_x, acc_y, acc_zz, acc_zzz;
+    typename mnt4_msm_t<params>::bn_t tmp_x, tmp_y, tmp_zz, tmp_zzz;
+
+    // Load modulus
+    cgbn_load(msm._env, P, (cgbn_mem_t<params::BITS>*)MNT4_298_P_DEVICE);
+
+    bool acc_is_infinity = true;
+
+    // Accumulate all points in this bucket
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t packed_idx = sorted_indices[win * n + start + i];
+        uint32_t point_idx = packed_idx & 0x7FFFFFFF;
+        bool negate = (packed_idx >> 31) != 0;
+
+        // Load point
+        cgbn_load(msm._env, px, (cgbn_mem_t<params::BITS>*)points[point_idx].x);
+        cgbn_load(msm._env, py, (cgbn_mem_t<params::BITS>*)points[point_idx].y);
+
+        // Apply negation if needed (negate y coordinate)
+        if (negate) {
+            // py = P - py
+            typename mnt4_msm_t<params>::bn_t neg_y;
+            cgbn_sub(msm._env, neg_y, P, py);
+            cgbn_set(msm._env, py, neg_y);
+        }
+
+        // Skip points at infinity
+        if (points[point_idx].infinity) continue;
+
+        if (acc_is_infinity) {
+            // First point: initialize accumulator as XYZZ with Z=1
+            cgbn_set(msm._env, acc_x, px);
+            cgbn_set(msm._env, acc_y, py);
+            cgbn_set_ui32(msm._env, acc_zz, 1);
+            cgbn_set_ui32(msm._env, acc_zzz, 1);
+            acc_is_infinity = false;
+        } else {
+            // Add point using mixed addition (XYZZ + Affine)
+            msm.point_add_mixed(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                               acc_x, acc_y, acc_zz, acc_zzz,
+                               px, py);
+
+            // Check if result is zero (happens when adding inverse points)
+            bool result_is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+            if (result_is_zero) {
+                acc_is_infinity = true;
+            } else {
+                cgbn_set(msm._env, acc_x, tmp_x);
+                cgbn_set(msm._env, acc_y, tmp_y);
+                cgbn_set(msm._env, acc_zz, tmp_zz);
+                cgbn_set(msm._env, acc_zzz, tmp_zzz);
+            }
+        }
+    }
+
+    // Store bucket result
+    buckets[instance].is_infinity = acc_is_infinity;
+    if (!acc_is_infinity) {
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].x, acc_x);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].y, acc_y);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].zz, acc_zz);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)buckets[instance].zzz, acc_zzz);
+    }
+}
+
+// ============================================================================
+// KERNEL 6: Bucket Integration (Horner-like sum within each window)
+// ============================================================================
+//
+// For each window, compute: sum = Σ (b * bucket[b]) for b = 1..num_buckets-1
+// Using Horner method: acc = bucket[N-1], sum = 0
+//   for b = N-1 down to 1: sum += acc; acc += bucket[b-1]
+//   return sum
+//
+template<class params>
+__global__ void integrate_buckets_mnt4_298(
+    cgbn_error_report_t* report,
+    bucket_xyzz_t* window_sums,     // Output: [nwins]
+    const bucket_xyzz_t* buckets,   // Input: [nwins * num_buckets]
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    // Each CGBN instance handles one window
+    int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / params::TPI;
+
+    if ((uint32_t)instance >= nwins) return;
+
+    uint32_t win = instance;
+    // +1 for bucket 2^(wbits-1) which can occur in Booth encoding
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+    uint32_t bucket_base = win * num_buckets;
+
+    // Initialize CGBN
+    mnt4_msm_t<params> msm(cgbn_report_monitor, report, instance);
+    typename mnt4_msm_t<params>::bn_t P;
+    typename mnt4_msm_t<params>::bn_t acc_x, acc_y, acc_zz, acc_zzz;
+    typename mnt4_msm_t<params>::bn_t sum_x, sum_y, sum_zz, sum_zzz;
+    typename mnt4_msm_t<params>::bn_t tmp_x, tmp_y, tmp_zz, tmp_zzz;
+    typename mnt4_msm_t<params>::bn_t bkt_x, bkt_y, bkt_zz, bkt_zzz;
+
+    // Load modulus
+    cgbn_load(msm._env, P, (cgbn_mem_t<params::BITS>*)MNT4_298_P_DEVICE);
+
+    bool acc_is_infinity = true;
+    bool sum_is_infinity = true;
+
+    // Horner-like integration: start from highest bucket
+    // Formula: S = Σ(b * bucket[b]) for b = 1 to num_buckets-1
+    // Algorithm: for b = num_buckets-1 down to 1:
+    //   acc += bucket[b]
+    //   sum += acc
+    for (int32_t b = num_buckets - 1; b >= 1; b--) {
+        uint32_t bkt_idx = bucket_base + b;
+
+        // First: acc += bucket[b]
+        if (!buckets[bkt_idx].is_infinity) {
+            cgbn_load(msm._env, bkt_x, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].x);
+            cgbn_load(msm._env, bkt_y, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].y);
+            cgbn_load(msm._env, bkt_zz, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].zz);
+            cgbn_load(msm._env, bkt_zzz, (cgbn_mem_t<params::BITS>*)buckets[bkt_idx].zzz);
+
+            if (acc_is_infinity) {
+                cgbn_set(msm._env, acc_x, bkt_x);
+                cgbn_set(msm._env, acc_y, bkt_y);
+                cgbn_set(msm._env, acc_zz, bkt_zz);
+                cgbn_set(msm._env, acc_zzz, bkt_zzz);
+                acc_is_infinity = false;
+            } else {
+                // Check if acc and bucket[b] are the same point (need doubling)
+                typename mnt4_msm_t<params>::bn_t lhs, rhs;
+                msm.field_mul(lhs, acc_x, bkt_zz, P);
+                msm.field_mul(rhs, bkt_x, acc_zz, P);
+                bool same_x = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                msm.field_mul(lhs, acc_y, bkt_zzz, P);
+                msm.field_mul(rhs, bkt_y, acc_zzz, P);
+                bool same_y = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                if (same_x && same_y) {
+                    // Same point: use doubling
+                    msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                    acc_x, acc_y, acc_zz, acc_zzz);
+                    cgbn_set(msm._env, acc_x, tmp_x);
+                    cgbn_set(msm._env, acc_y, tmp_y);
+                    cgbn_set(msm._env, acc_zz, tmp_zz);
+                    cgbn_set(msm._env, acc_zzz, tmp_zzz);
+                } else if (same_x) {
+                    // Inverse points -> result is infinity
+                    acc_is_infinity = true;
+                } else {
+                    // Different points: use standard addition
+                    msm.point_add(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                 acc_x, acc_y, acc_zz, acc_zzz,
+                                 bkt_x, bkt_y, bkt_zz, bkt_zzz);
+
+                    bool result_is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+                    if (result_is_zero) {
+                        acc_is_infinity = true;
+                    } else {
+                        cgbn_set(msm._env, acc_x, tmp_x);
+                        cgbn_set(msm._env, acc_y, tmp_y);
+                        cgbn_set(msm._env, acc_zz, tmp_zz);
+                        cgbn_set(msm._env, acc_zzz, tmp_zzz);
+                    }
+                }
+            }
+        }
+
+        // Second: sum += acc
+        if (!acc_is_infinity) {
+            if (sum_is_infinity) {
+                cgbn_set(msm._env, sum_x, acc_x);
+                cgbn_set(msm._env, sum_y, acc_y);
+                cgbn_set(msm._env, sum_zz, acc_zz);
+                cgbn_set(msm._env, sum_zzz, acc_zzz);
+                sum_is_infinity = false;
+            } else {
+                // Check if sum and acc are the same point (need doubling)
+                // Two XYZZ points (X1,Y1,ZZ1,ZZZ1) and (X2,Y2,ZZ2,ZZZ2) are equal if:
+                // X1*ZZ2 = X2*ZZ1 and Y1*ZZZ2 = Y2*ZZZ1
+                typename mnt4_msm_t<params>::bn_t lhs, rhs;
+                msm.field_mul(lhs, sum_x, acc_zz, P);
+                msm.field_mul(rhs, acc_x, sum_zz, P);
+                bool same_x = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                msm.field_mul(lhs, sum_y, acc_zzz, P);
+                msm.field_mul(rhs, acc_y, sum_zzz, P);
+                bool same_y = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                if (same_x && same_y) {
+                    // Same point: use doubling
+                    msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                    sum_x, sum_y, sum_zz, sum_zzz);
+                    cgbn_set(msm._env, sum_x, tmp_x);
+                    cgbn_set(msm._env, sum_y, tmp_y);
+                    cgbn_set(msm._env, sum_zz, tmp_zz);
+                    cgbn_set(msm._env, sum_zzz, tmp_zzz);
+                } else if (same_x) {
+                    // Same x but different y means inverse points -> result is infinity
+                    sum_is_infinity = true;
+                } else {
+                    // Different points: use standard addition
+                    msm.point_add(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                 sum_x, sum_y, sum_zz, sum_zzz,
+                                 acc_x, acc_y, acc_zz, acc_zzz);
+
+                    bool result_is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+                    if (result_is_zero) {
+                        sum_is_infinity = true;
+                    } else {
+                        cgbn_set(msm._env, sum_x, tmp_x);
+                        cgbn_set(msm._env, sum_y, tmp_y);
+                        cgbn_set(msm._env, sum_zz, tmp_zz);
+                        cgbn_set(msm._env, sum_zzz, tmp_zzz);
+                    }
+                }
+            }
+        }
+    }
+
+    // NOTE: No final addition needed. The Horner loop already gives the correct result.
+    // The formula is: S = Σ(b * bucket[b]) for b = 1 to num_buckets-1
+    // After the loop, sum contains this result.
+
+    // Store window sum
+    window_sums[win].is_infinity = sum_is_infinity;
+    if (!sum_is_infinity) {
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].x, sum_x);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].y, sum_y);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].zz, sum_zz);
+        cgbn_store(msm._env, (cgbn_mem_t<params::BITS>*)window_sums[win].zzz, sum_zzz);
+    }
+}
+
+// ============================================================================
+// KERNEL 7: Window Combination (merge window sums with doublings)
+// ============================================================================
+//
+// Combine window sums: result = Σ window_sum[w] * 2^(w*wbits)
+// Using: result = window_sum[nwins-1]
+//   for w = nwins-2 down to 0:
+//     result = 2^wbits * result + window_sum[w]
+//
+template<class params>
+__global__ void combine_windows_mnt4_298(
+    cgbn_error_report_t* report,
+    jacobian_cgbn_t* result_out,
+    const bucket_xyzz_t* window_sums,
+    uint32_t nwins,
+    uint32_t wbits
+) {
+    // Single CGBN instance does the final combination
+    int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / params::TPI;
+    if (instance != 0) return;
+
+    mnt4_msm_t<params> msm(cgbn_report_monitor, report, instance);
+    typename mnt4_msm_t<params>::bn_t P;
+    typename mnt4_msm_t<params>::bn_t res_x, res_y, res_zz, res_zzz;
+    typename mnt4_msm_t<params>::bn_t tmp_x, tmp_y, tmp_zz, tmp_zzz;
+    typename mnt4_msm_t<params>::bn_t win_x, win_y, win_zz, win_zzz;
+
+    cgbn_load(msm._env, P, (cgbn_mem_t<params::BITS>*)MNT4_298_P_DEVICE);
+
+    bool result_is_infinity = true;
+
+    // Start with highest window
+    for (int32_t w = nwins - 1; w >= 0; w--) {
+        // Double result wbits times (if not first iteration)
+        if (w < (int32_t)nwins - 1 && !result_is_infinity) {
+            for (uint32_t d = 0; d < wbits; d++) {
+                msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                res_x, res_y, res_zz, res_zzz);
+                cgbn_set(msm._env, res_x, tmp_x);
+                cgbn_set(msm._env, res_y, tmp_y);
+                cgbn_set(msm._env, res_zz, tmp_zz);
+                cgbn_set(msm._env, res_zzz, tmp_zzz);
+            }
+        }
+
+        // Add window sum
+        if (!window_sums[w].is_infinity) {
+            cgbn_load(msm._env, win_x, (cgbn_mem_t<params::BITS>*)window_sums[w].x);
+            cgbn_load(msm._env, win_y, (cgbn_mem_t<params::BITS>*)window_sums[w].y);
+            cgbn_load(msm._env, win_zz, (cgbn_mem_t<params::BITS>*)window_sums[w].zz);
+            cgbn_load(msm._env, win_zzz, (cgbn_mem_t<params::BITS>*)window_sums[w].zzz);
+
+            if (result_is_infinity) {
+                cgbn_set(msm._env, res_x, win_x);
+                cgbn_set(msm._env, res_y, win_y);
+                cgbn_set(msm._env, res_zz, win_zz);
+                cgbn_set(msm._env, res_zzz, win_zzz);
+                result_is_infinity = false;
+            } else {
+                // Check if result and window_sum are the same point (need doubling)
+                typename mnt4_msm_t<params>::bn_t lhs, rhs;
+                msm.field_mul(lhs, res_x, win_zz, P);
+                msm.field_mul(rhs, win_x, res_zz, P);
+                bool same_x = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                msm.field_mul(lhs, res_y, win_zzz, P);
+                msm.field_mul(rhs, win_y, res_zzz, P);
+                bool same_y = cgbn_compare(msm._env, lhs, rhs) == 0;
+
+                if (same_x && same_y) {
+                    // Same point: use doubling
+                    msm.point_double(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                    res_x, res_y, res_zz, res_zzz);
+                    cgbn_set(msm._env, res_x, tmp_x);
+                    cgbn_set(msm._env, res_y, tmp_y);
+                    cgbn_set(msm._env, res_zz, tmp_zz);
+                    cgbn_set(msm._env, res_zzz, tmp_zzz);
+                } else if (same_x) {
+                    // Inverse points -> result is infinity
+                    result_is_infinity = true;
+                } else {
+                    // Different points: use standard addition
+                    msm.point_add(P, tmp_x, tmp_y, tmp_zz, tmp_zzz,
+                                 res_x, res_y, res_zz, res_zzz,
+                                 win_x, win_y, win_zz, win_zzz);
+
+                    bool is_zero = cgbn_equals_ui32(msm._env, tmp_zz, 0);
+                    if (is_zero) {
+                        result_is_infinity = true;
+                    } else {
+                        cgbn_set(msm._env, res_x, tmp_x);
+                        cgbn_set(msm._env, res_y, tmp_y);
+                        cgbn_set(msm._env, res_zz, tmp_zz);
+                        cgbn_set(msm._env, res_zzz, tmp_zzz);
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert XYZZ to Jacobian
+    if (result_is_infinity) {
+        for (int i = 0; i < 10; i++) {
+            result_out->x[i] = 0;
+            result_out->y[i] = 0;
+            result_out->z[i] = 0;
+        }
+        result_out->infinity = true;
+    } else {
+        msm.xyzz_to_jacobian(P, result_out, res_x, res_y, res_zz, res_zzz);
+    }
+}
+
+// ============================================================================
+// FFI Entry Point: Pippenger MSM for MNT4-298 G1
+// ============================================================================
+extern "C" int msm_mnt4_298_g1_cgbn_pippenger(
+    const void* points_ptr,
+    const void* scalars_ptr,
+    size_t count,
+    void* result_ptr,
+    size_t ffi_affine_sz,
+    size_t ffi_scalar_sz
+) {
+    // Validate FFI layout
+    if (ffi_affine_sz != sizeof(affine_cgbn_t)) {
+        fprintf(stderr, "[MNT4-298 Pippenger] ERROR: Affine size mismatch\n");
+        return MNT4_MSM_ERROR_AFFINE_LAYOUT;
+    }
+    if (ffi_scalar_sz != sizeof(scalar_cgbn_t)) {
+        fprintf(stderr, "[MNT4-298 Pippenger] ERROR: Scalar size mismatch\n");
+        return MNT4_MSM_ERROR_SCALAR_LAYOUT;
+    }
+
+    // Handle edge case
+    if (count == 0) {
+        jacobian_cgbn_t* result = static_cast<jacobian_cgbn_t*>(result_ptr);
+        memset(result, 0, sizeof(jacobian_cgbn_t));
+        result->infinity = true;
+        return MNT4_MSM_SUCCESS;
+    }
+
+    // For very small inputs, use serial algorithm (less overhead)
+    if (count < 64) {
+        return msm_mnt4_298_g1_cgbn(points_ptr, scalars_ptr, count,
+                                    result_ptr, ffi_affine_sz, ffi_scalar_sz);
+    }
+
+    const affine_cgbn_t* points = static_cast<const affine_cgbn_t*>(points_ptr);
+    const scalar_cgbn_t* scalars = static_cast<const scalar_cgbn_t*>(scalars_ptr);
+    jacobian_cgbn_t* result = static_cast<jacobian_cgbn_t*>(result_ptr);
+
+    // Compute optimal parameters
+    uint32_t n = (uint32_t)count;
+    uint32_t wbits = compute_optimal_wbits(n);
+    uint32_t nwins = compute_nwins(PIPPENGER_SCALAR_BITS, wbits);
+    // +1 for bucket 2^(wbits-1) which can occur in Booth encoding
+    uint32_t num_buckets = (1u << (wbits - 1)) + 1;
+    uint32_t total_buckets = nwins * num_buckets;
+
+    // Allocate device memory
+    cudaError_t err;
+    affine_cgbn_t* d_points = nullptr;
+    scalar_cgbn_t* d_scalars = nullptr;
+    uint32_t* d_digits = nullptr;
+    uint32_t* d_histogram = nullptr;
+    uint32_t* d_offsets = nullptr;
+    uint32_t* d_bucket_counters = nullptr;
+    uint32_t* d_sorted_indices = nullptr;
+    bucket_xyzz_t* d_buckets = nullptr;
+    bucket_xyzz_t* d_window_sums = nullptr;
+    jacobian_cgbn_t* d_result = nullptr;
+    cgbn_error_report_t* d_report = nullptr;
+
+    // Allocation
+    err = cudaMalloc(&d_points, sizeof(affine_cgbn_t) * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_scalars, sizeof(scalar_cgbn_t) * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_digits, sizeof(uint32_t) * nwins * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_histogram, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_offsets, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_bucket_counters, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_sorted_indices, sizeof(uint32_t) * nwins * n);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_buckets, sizeof(bucket_xyzz_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_window_sums, sizeof(bucket_xyzz_t) * nwins);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMalloc(&d_result, sizeof(jacobian_cgbn_t));
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cgbn_error_report_alloc(&d_report);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    // Copy inputs to device
+    err = cudaMemcpy(d_points, points, sizeof(affine_cgbn_t) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMemcpy(d_scalars, scalars, sizeof(scalar_cgbn_t) * n, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    // Zero histograms and counters
+    err = cudaMemset(d_histogram, 0, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    err = cudaMemset(d_bucket_counters, 0, sizeof(uint32_t) * total_buckets);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    {
+        // Kernel launches
+        int threads = 256;
+        int blocks_n = (n + threads - 1) / threads;
+        int blocks_nwins = (nwins + threads - 1) / threads;
+
+        // 1. Breakdown scalars
+        breakdown_scalars_mnt4_298<<<blocks_n, threads>>>(
+            d_digits, d_scalars, n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        // 2. Build histogram
+        histogram_buckets_mnt4_298<<<blocks_n, threads>>>(
+            d_histogram, d_digits, n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        // 3. Prefix sum for offsets
+        prefix_sum_histogram_mnt4_298<<<blocks_nwins, threads>>>(
+            d_offsets, d_histogram, nwins, num_buckets
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        // 4. Scatter to buckets
+        scatter_to_buckets_mnt4_298<<<blocks_n, threads>>>(
+            d_sorted_indices, d_bucket_counters, d_offsets, d_digits,
+            n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        // 5. Accumulate buckets (CGBN kernel)
+        int tpi = mnt4_cgbn_params_t::TPI;
+        int threads_accumulate = 32 * tpi;  // 32 CGBN instances per block
+        int instances_needed = total_buckets;
+        int blocks_accumulate = (instances_needed * tpi + threads_accumulate - 1) / threads_accumulate;
+
+        accumulate_buckets_mnt4_298<mnt4_cgbn_params_t><<<blocks_accumulate, threads_accumulate>>>(
+            d_report, d_buckets, d_points, d_sorted_indices, d_offsets, d_histogram,
+            n, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        // 6. Integrate buckets (CGBN kernel)
+        int instances_integrate = nwins;
+        int blocks_integrate = (instances_integrate * tpi + threads_accumulate - 1) / threads_accumulate;
+
+        integrate_buckets_mnt4_298<mnt4_cgbn_params_t><<<blocks_integrate, threads_accumulate>>>(
+            d_report, d_window_sums, d_buckets, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        // 7. Combine windows (single CGBN instance)
+        combine_windows_mnt4_298<mnt4_cgbn_params_t><<<1, tpi>>>(
+            d_report, d_result, d_window_sums, nwins, wbits
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto pippenger_cleanup_error;
+    }
+
+    // Check CGBN errors
+    if (cgbn_error_report_check(d_report)) {
+        fprintf(stderr, "[MNT4-298 Pippenger] ERROR: CGBN error detected\n");
+        goto pippenger_cleanup_error;
+    }
+
+    // Copy result back
+    err = cudaMemcpy(result, d_result, sizeof(jacobian_cgbn_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) goto pippenger_cleanup_error;
+
+    // Cleanup
+    cudaFree(d_points);
+    cudaFree(d_scalars);
+    cudaFree(d_digits);
+    cudaFree(d_histogram);
+    cudaFree(d_offsets);
+    cudaFree(d_bucket_counters);
+    cudaFree(d_sorted_indices);
+    cudaFree(d_buckets);
+    cudaFree(d_window_sums);
+    cudaFree(d_result);
+    cgbn_error_report_free(d_report);
+
+    return MNT4_MSM_SUCCESS;
+
+pippenger_cleanup_error:
+    if (d_points) cudaFree(d_points);
+    if (d_scalars) cudaFree(d_scalars);
+    if (d_digits) cudaFree(d_digits);
+    if (d_histogram) cudaFree(d_histogram);
+    if (d_offsets) cudaFree(d_offsets);
+    if (d_bucket_counters) cudaFree(d_bucket_counters);
+    if (d_sorted_indices) cudaFree(d_sorted_indices);
+    if (d_buckets) cudaFree(d_buckets);
+    if (d_window_sums) cudaFree(d_window_sums);
+    if (d_result) cudaFree(d_result);
+    if (d_report) cgbn_error_report_free(d_report);
+    return MNT4_MSM_ERROR_CUDA_RUNTIME;
+}
