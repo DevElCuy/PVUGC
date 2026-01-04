@@ -1083,25 +1083,31 @@ fn compute_witness_bases<C: RecursionCycle>(
     let total_pairs = sorted_pairs.len();
     let progress_counter = std::sync::atomic::AtomicUsize::new(0);
 
-    // GPU batch size - dynamically computed based on available memory
+    // GPU batch size - dynamically computed based on available GPU memory
     // Each pair needs: max_col_a*40 + max_col_b*40 + max_diag*4 + max_diag*40 bytes
-    // We target using at most 500MB for output buffers since we also need input data
-    // and Rayon may run multiple batches in parallel
+    // We use GPU_MEMORY_PERCENT env var (default 80%) of available GPU memory
     #[cfg(feature = "gpu")]
     let gpu_batch_size = {
         let max_diag = std::cmp::min(max_col_a, max_col_b);
         let bytes_per_pair = (max_col_a * 40) + (max_col_b * 40) + (max_diag * 4) + (max_diag * 40);
-        let target_memory_bytes = 500_000_000usize; // 500MB to be safe
+
+        // Query actual GPU memory and compute target based on GPU_MEMORY_PERCENT
+        let target_memory_bytes = sppark_msm::get_gpu_target_memory();
+
         let computed_batch = if bytes_per_pair > 0 {
             target_memory_bytes / bytes_per_pair
         } else {
-            10000
+            100000  // Reasonable default if bytes_per_pair is somehow 0
         };
-        let batch_size = computed_batch.clamp(100, 10000);
-        println!("[Quotient] GPU batch size: {} ({}MB per batch, {} bytes/pair)",
+
+        // Clamp to reasonable bounds: min 100 pairs, no max (let memory be the limit)
+        let batch_size = computed_batch.max(100);
+
+        println!("[Quotient] GPU batch size: {} ({}MB per batch, {} bytes/pair, target {}MB)",
                  batch_size,
                  (batch_size * bytes_per_pair) / (1024 * 1024),
-                 bytes_per_pair);
+                 bytes_per_pair,
+                 target_memory_bytes / (1024 * 1024));
         batch_size
     };
     #[cfg(not(feature = "gpu"))]

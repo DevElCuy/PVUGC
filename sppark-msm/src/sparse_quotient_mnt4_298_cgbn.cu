@@ -655,4 +655,50 @@ int sparse_quotient_mnt4_298_gpu_available() {
     return 1;
 }
 
+/**
+ * Query available GPU memory in bytes
+ *
+ * Returns the free memory on the current GPU device.
+ * Returns 0 if CUDA is not available or an error occurs.
+ */
+size_t gpu_get_available_memory() {
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count == 0) {
+        return 0;
+    }
+
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+
+    return free_mem;
+}
+
+/**
+ * Query total GPU memory in bytes
+ *
+ * Returns the total memory on the current GPU device.
+ * Returns 0 if CUDA is not available or an error occurs.
+ */
+size_t gpu_get_total_memory() {
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count == 0) {
+        return 0;
+    }
+
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+
+    return total_mem;
+}
+
 } // extern "C"
