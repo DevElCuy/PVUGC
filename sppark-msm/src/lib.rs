@@ -211,8 +211,28 @@ extern "C" {
         ffi_scalar_sz: usize,
     ) -> i32;
 
+    #[cfg(mnt4_cgbn_available)]
+    fn msm_mnt4_298_g1_cgbn_pippenger(
+        points: *const ark_mnt4_298::G1Affine,
+        scalars: *const BigInt<5>,
+        count: usize,
+        result: *mut ark_mnt4_298::G1Projective,
+        ffi_affine_sz: usize,
+        ffi_scalar_sz: usize,
+    ) -> i32;
+
     #[cfg(mnt6_cgbn_available)]
     fn msm_mnt6_298_g1_cgbn(
+        points: *const ark_mnt6_298::G1Affine,
+        scalars: *const BigInt<5>,
+        count: usize,
+        result: *mut ark_mnt6_298::G1Projective,
+        ffi_affine_sz: usize,
+        ffi_scalar_sz: usize,
+    ) -> i32;
+
+    #[cfg(mnt6_cgbn_available)]
+    fn msm_mnt6_298_g1_cgbn_pippenger(
         points: *const ark_mnt6_298::G1Affine,
         scalars: *const BigInt<5>,
         count: usize,
@@ -721,6 +741,124 @@ pub fn msm_mnt4_298_gpu_cgbn(
     Err(MntGpuError::KernelUnavailable)
 }
 
+// ========== MNT4-298 Pippenger GPU MSM Implementation ==========
+
+/// Pippenger-based GPU MSM for MNT4-298 G1.
+/// Uses bucket method for O(n + nwins * 2^wbits) complexity instead of O(n * scalar_bits).
+/// Automatically falls back to serial CGBN for small inputs (n < 64).
+#[cfg(all(feature = "gpu", mnt4_cgbn_available))]
+pub fn msm_mnt4_298_gpu_pippenger(
+    points: &[ark_mnt4_298::G1Affine],
+    scalars: &[BigInt<5>],
+) -> Result<ark_mnt4_298::G1Projective, MntGpuError> {
+    use ark_ff::PrimeField;
+    use ark_mnt4_298::Fq;
+
+    if points.len() != scalars.len() {
+        return Err(MntGpuError::Unknown(-99));
+    }
+
+    // CUDA expects uint32_t[10], but arkworks BigInt<5> is u64[5]
+    #[repr(C)]
+    struct PlainG1Affine {
+        x: [u32; 10],
+        y: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    #[repr(C)]
+    struct PlainG1Projective {
+        x: [u32; 10],
+        y: [u32; 10],
+        z: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    fn bigint_to_u32_array(bigint: ark_ff::BigInt<5>) -> [u32; 10] {
+        let mut result = [0u32; 10];
+        for (i, &limb_u64) in bigint.0.iter().enumerate() {
+            result[i * 2] = limb_u64 as u32;
+            result[i * 2 + 1] = (limb_u64 >> 32) as u32;
+        }
+        result
+    }
+
+    fn u32_array_to_bigint(arr: &[u32; 10]) -> ark_ff::BigInt<5> {
+        let mut limbs = [0u64; 5];
+        for i in 0..5 {
+            limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+        }
+        ark_ff::BigInt::<5>(limbs)
+    }
+
+    let plain_points: Vec<PlainG1Affine> = points.iter().map(|p| {
+        if p.infinity {
+            PlainG1Affine {
+                x: [0u32; 10],
+                y: [0u32; 10],
+                infinity: true,
+                _padding: [0u8; 7],
+            }
+        } else {
+            let x_bigint = p.x.into_bigint();
+            let y_bigint = p.y.into_bigint();
+            PlainG1Affine {
+                x: bigint_to_u32_array(x_bigint),
+                y: bigint_to_u32_array(y_bigint),
+                infinity: false,
+                _padding: [0u8; 7],
+            }
+        }
+    }).collect();
+
+    let mut plain_result = PlainG1Projective {
+        x: [0u32; 10],
+        y: [0u32; 10],
+        z: [0u32; 10],
+        infinity: false,
+        _padding: [0u8; 7],
+    };
+
+    let status = unsafe {
+        msm_mnt4_298_g1_cgbn_pippenger(
+            plain_points.as_ptr() as *const ark_mnt4_298::G1Affine,
+            scalars.as_ptr(),
+            points.len(),
+            &mut plain_result as *mut PlainG1Projective as *mut ark_mnt4_298::G1Projective,
+            core::mem::size_of::<PlainG1Affine>(),
+            core::mem::size_of::<BigInt<5>>(),
+        )
+    };
+
+    if status != 0 {
+        return Err(MntGpuError::from_status(status));
+    }
+
+    if plain_result.infinity {
+        return Ok(ark_mnt4_298::G1Projective::default());
+    }
+
+    let x_bigint = u32_array_to_bigint(&plain_result.x);
+    let y_bigint = u32_array_to_bigint(&plain_result.y);
+    let z_bigint = u32_array_to_bigint(&plain_result.z);
+
+    let x_fq = Fq::from_bigint(x_bigint).ok_or(MntGpuError::Unknown(-100))?;
+    let y_fq = Fq::from_bigint(y_bigint).ok_or(MntGpuError::Unknown(-101))?;
+    let z_fq = Fq::from_bigint(z_bigint).ok_or(MntGpuError::Unknown(-102))?;
+
+    Ok(ark_mnt4_298::G1Projective::new_unchecked(x_fq, y_fq, z_fq))
+}
+
+#[cfg(all(feature = "gpu", not(mnt4_cgbn_available)))]
+pub fn msm_mnt4_298_gpu_pippenger(
+    _points: &[ark_mnt4_298::G1Affine],
+    _scalars: &[BigInt<5>],
+) -> Result<ark_mnt4_298::G1Projective, MntGpuError> {
+    Err(MntGpuError::KernelUnavailable)
+}
+
 // ========== MNT6-298 GPU MSM Implementation ==========
 
 // Note: GpuMsm trait is NOT implemented for MNT6-298 because MNT4 and MNT6
@@ -843,6 +981,122 @@ pub fn msm_mnt6_298_gpu_cgbn(
     Err(MntGpuError::KernelUnavailable)
 }
 
+/// Pippenger-based GPU MSM for MNT6-298 G1.
+/// Uses bucket method for O(n + nwins * 2^wbits) complexity instead of O(n * scalar_bits).
+/// Automatically falls back to serial CGBN for small inputs (n < 64).
+#[cfg(all(feature = "gpu", mnt6_cgbn_available))]
+pub fn msm_mnt6_298_gpu_pippenger(
+    points: &[ark_mnt6_298::G1Affine],
+    scalars: &[BigInt<5>],
+) -> Result<ark_mnt6_298::G1Projective, MntGpuError> {
+    use ark_ff::PrimeField;
+    use ark_mnt6_298::Fq;
+
+    if points.len() != scalars.len() {
+        return Err(MntGpuError::Unknown(-99));
+    }
+
+    // CUDA expects uint32_t[10], but arkworks BigInt<5> is u64[5]
+    #[repr(C)]
+    struct PlainG1Affine {
+        x: [u32; 10],
+        y: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    #[repr(C)]
+    struct PlainG1Projective {
+        x: [u32; 10],
+        y: [u32; 10],
+        z: [u32; 10],
+        infinity: bool,
+        _padding: [u8; 7],
+    }
+
+    fn bigint_to_u32_array(bigint: ark_ff::BigInt<5>) -> [u32; 10] {
+        let mut result = [0u32; 10];
+        for (i, &limb_u64) in bigint.0.iter().enumerate() {
+            result[i * 2] = limb_u64 as u32;
+            result[i * 2 + 1] = (limb_u64 >> 32) as u32;
+        }
+        result
+    }
+
+    fn u32_array_to_bigint(arr: &[u32; 10]) -> ark_ff::BigInt<5> {
+        let mut limbs = [0u64; 5];
+        for i in 0..5 {
+            limbs[i] = (arr[i * 2] as u64) | ((arr[i * 2 + 1] as u64) << 32);
+        }
+        ark_ff::BigInt::<5>(limbs)
+    }
+
+    let plain_points: Vec<PlainG1Affine> = points.iter().map(|p| {
+        if p.infinity {
+            PlainG1Affine {
+                x: [0u32; 10],
+                y: [0u32; 10],
+                infinity: true,
+                _padding: [0u8; 7],
+            }
+        } else {
+            let x_bigint = p.x.into_bigint();
+            let y_bigint = p.y.into_bigint();
+            PlainG1Affine {
+                x: bigint_to_u32_array(x_bigint),
+                y: bigint_to_u32_array(y_bigint),
+                infinity: false,
+                _padding: [0u8; 7],
+            }
+        }
+    }).collect();
+
+    let mut plain_result = PlainG1Projective {
+        x: [0u32; 10],
+        y: [0u32; 10],
+        z: [0u32; 10],
+        infinity: false,
+        _padding: [0u8; 7],
+    };
+
+    let status = unsafe {
+        msm_mnt6_298_g1_cgbn_pippenger(
+            plain_points.as_ptr() as *const ark_mnt6_298::G1Affine,
+            scalars.as_ptr(),
+            points.len(),
+            &mut plain_result as *mut PlainG1Projective as *mut ark_mnt6_298::G1Projective,
+            core::mem::size_of::<PlainG1Affine>(),
+            core::mem::size_of::<BigInt<5>>(),
+        )
+    };
+
+    if status != 0 {
+        return Err(MntGpuError::from_status(status));
+    }
+
+    if plain_result.infinity {
+        return Ok(ark_mnt6_298::G1Projective::default());
+    }
+
+    let x_bigint = u32_array_to_bigint(&plain_result.x);
+    let y_bigint = u32_array_to_bigint(&plain_result.y);
+    let z_bigint = u32_array_to_bigint(&plain_result.z);
+
+    let x_fq = Fq::from_bigint(x_bigint).ok_or(MntGpuError::Unknown(-100))?;
+    let y_fq = Fq::from_bigint(y_bigint).ok_or(MntGpuError::Unknown(-101))?;
+    let z_fq = Fq::from_bigint(z_bigint).ok_or(MntGpuError::Unknown(-102))?;
+
+    Ok(ark_mnt6_298::G1Projective::new_unchecked(x_fq, y_fq, z_fq))
+}
+
+#[cfg(all(feature = "gpu", not(mnt6_cgbn_available)))]
+pub fn msm_mnt6_298_gpu_pippenger(
+    _points: &[ark_mnt6_298::G1Affine],
+    _scalars: &[BigInt<5>],
+) -> Result<ark_mnt6_298::G1Projective, MntGpuError> {
+    Err(MntGpuError::KernelUnavailable)
+}
+
 // ========== Sparse Quotient GPU Coefficient Computation ==========
 
 /// Error type for sparse quotient GPU operations
@@ -878,7 +1132,7 @@ pub struct SparseMatrixCsr {
     pub values: Vec<[u32; 10]>,
 }
 
-/// Output from sparse quotient coefficient computation for one pair
+/// Output from sparse quotient coefficient computation for one pair (MNT4/MNT6)
 #[cfg(feature = "gpu")]
 #[derive(Clone)]
 pub struct SparseQuotientPairOutput {
@@ -888,6 +1142,30 @@ pub struct SparseQuotientPairOutput {
     pub acc_v: Vec<[u32; 10]>,
     /// Diagonal terms: (row_index, scalar_value)
     pub diag_terms: Vec<(u32, [u32; 10])>,
+}
+
+/// Sparse matrix in CSR format for BW6-761 GPU sparse quotient computation
+/// BW6-761 scalar field (Fr) is 377 bits, using 12 u32 limbs (48 bytes each)
+#[cfg(feature = "gpu")]
+pub struct SparseMatrixCsrBw6 {
+    /// Column pointers: col_ptr[i] is the start index of column i in row_idx/values
+    pub col_ptr: Vec<u32>,
+    /// Row indices for each non-zero entry
+    pub row_idx: Vec<u32>,
+    /// Scalar values (as u32[12] arrays, 48 bytes each for 377-bit field)
+    pub values: Vec<[u32; 12]>,
+}
+
+/// Output from sparse quotient coefficient computation for one pair (BW6-761)
+#[cfg(feature = "gpu")]
+#[derive(Clone)]
+pub struct SparseQuotientPairOutputBw6 {
+    /// Accumulated coefficients for col_a entries (indexed by local position in column)
+    pub acc_u: Vec<[u32; 12]>,
+    /// Accumulated coefficients for col_b entries (indexed by local position in column)
+    pub acc_v: Vec<[u32; 12]>,
+    /// Diagonal terms: (row_index, scalar_value)
+    pub diag_terms: Vec<(u32, [u32; 12])>,
 }
 
 #[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
@@ -928,9 +1206,152 @@ extern "C" {
     ) -> i32;
 
     fn sparse_quotient_mnt4_298_gpu_available() -> i32;
+
+    fn sparse_quotient_coeffs_mnt6_298_gpu(
+        // Sparse matrix A (CSR)
+        col_a_ptr: *const u32,
+        col_a_idx: *const u32,
+        col_a_val: *const [u32; 10],
+        num_cols_a: u32,
+        nnz_a: u32,
+        // Sparse matrix B (CSR)
+        col_b_ptr: *const u32,
+        col_b_idx: *const u32,
+        col_b_val: *const [u32; 10],
+        num_cols_b: u32,
+        nnz_b: u32,
+        // Domain element tables
+        domain_elements: *const [u32; 10],
+        inv_domain_elements: *const [u32; 10],
+        inv_n_one_minus_omega: *const [u32; 10],
+        domain_size: u32,
+        // Pair batch
+        pairs_i: *const u32,
+        pairs_j: *const u32,
+        num_pairs: u32,
+        // Output sizing
+        max_col_a: u32,
+        max_col_b: u32,
+        max_diag_per_pair: u32,
+        // Output arrays
+        out_acc_u: *mut [u32; 10],
+        out_acc_v: *mut [u32; 10],
+        out_diag_k: *mut u32,
+        out_diag_val: *mut [u32; 10],
+        out_num_diag: *mut u32,
+    ) -> i32;
+
+    fn sparse_quotient_mnt6_298_gpu_available() -> i32;
+
+    fn sparse_quotient_coeffs_bw6_761_gpu(
+        // Sparse matrix A (CSR)
+        col_a_ptr: *const u32,
+        col_a_idx: *const u32,
+        col_a_val: *const [u32; 12],  // BW6-761 Fr uses 12 limbs (377-bit)
+        num_cols_a: u32,
+        nnz_a: u32,
+        // Sparse matrix B (CSR)
+        col_b_ptr: *const u32,
+        col_b_idx: *const u32,
+        col_b_val: *const [u32; 12],
+        num_cols_b: u32,
+        nnz_b: u32,
+        // Domain element tables
+        domain_elements: *const [u32; 12],
+        inv_domain_elements: *const [u32; 12],
+        inv_n_one_minus_omega: *const [u32; 12],
+        domain_size: u32,
+        // Pair batch
+        pairs_i: *const u32,
+        pairs_j: *const u32,
+        num_pairs: u32,
+        // Output sizing
+        max_col_a: u32,
+        max_col_b: u32,
+        max_diag_per_pair: u32,
+        // Output arrays
+        out_acc_u: *mut [u32; 12],
+        out_acc_v: *mut [u32; 12],
+        out_diag_k: *mut u32,
+        out_diag_val: *mut [u32; 12],
+        out_num_diag: *mut u32,
+    ) -> i32;
+
+    fn sparse_quotient_bw6_761_gpu_available() -> i32;
+
+    fn gpu_get_available_memory() -> usize;
+    fn gpu_get_total_memory() -> usize;
 }
 
-/// Check if sparse quotient GPU kernel is available
+/// Get available (free) GPU memory in bytes
+///
+/// Returns 0 if GPU is not available or an error occurs.
+#[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
+pub fn get_gpu_available_memory() -> usize {
+    unsafe { gpu_get_available_memory() }
+}
+
+#[cfg(any(not(feature = "gpu"), sppark_cuda_stub))]
+pub fn get_gpu_available_memory() -> usize {
+    0
+}
+
+/// Get total GPU memory in bytes
+///
+/// Returns 0 if GPU is not available or an error occurs.
+#[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
+pub fn get_gpu_total_memory() -> usize {
+    unsafe { gpu_get_total_memory() }
+}
+
+#[cfg(any(not(feature = "gpu"), sppark_cuda_stub))]
+pub fn get_gpu_total_memory() -> usize {
+    0
+}
+
+/// Get the configured GPU memory utilization percentage
+///
+/// Reads from GPU_MEMORY_PERCENT environment variable.
+/// Defaults to 80% if not set or invalid.
+/// Clamps to range [10, 95] for safety.
+pub fn get_gpu_memory_percent() -> u32 {
+    std::env::var("GPU_MEMORY_PERCENT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|p| p.clamp(10, 95))
+        .unwrap_or(80)
+}
+
+/// Calculate target GPU memory for batch operations
+///
+/// Returns (available_memory * percent / 100), or 500MB as fallback if GPU memory
+/// cannot be detected.
+#[cfg(feature = "gpu")]
+pub fn get_gpu_target_memory() -> usize {
+    let available = get_gpu_available_memory();
+    let percent = get_gpu_memory_percent() as usize;
+
+    if available > 0 {
+        let target = (available * percent) / 100;
+        // Log memory detection
+        let available_mb = available / (1024 * 1024);
+        let target_mb = target / (1024 * 1024);
+        eprintln!("[GPU Memory] Available: {}MB, Target ({}%): {}MB",
+                  available_mb, percent, target_mb);
+        target
+    } else {
+        // Fallback to conservative 500MB if detection fails
+        eprintln!("[GPU Memory] Detection failed, using 500MB fallback");
+        500_000_000
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn get_gpu_target_memory() -> usize {
+    500_000_000
+}
+
+/// Check if MNT4-298 sparse quotient GPU kernel is available
 #[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
 pub fn sparse_quotient_gpu_available() -> bool {
     unsafe { sparse_quotient_mnt4_298_gpu_available() != 0 }
@@ -938,6 +1359,28 @@ pub fn sparse_quotient_gpu_available() -> bool {
 
 #[cfg(any(not(feature = "gpu"), sppark_cuda_stub))]
 pub fn sparse_quotient_gpu_available() -> bool {
+    false
+}
+
+/// Check if MNT6-298 sparse quotient GPU kernel is available
+#[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
+pub fn sparse_quotient_mnt6_gpu_available() -> bool {
+    unsafe { sparse_quotient_mnt6_298_gpu_available() != 0 }
+}
+
+#[cfg(any(not(feature = "gpu"), sppark_cuda_stub))]
+pub fn sparse_quotient_mnt6_gpu_available() -> bool {
+    false
+}
+
+/// Check if BW6-761 sparse quotient GPU kernel is available
+#[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
+pub fn sparse_quotient_bw6_gpu_available() -> bool {
+    unsafe { sparse_quotient_bw6_761_gpu_available() != 0 }
+}
+
+#[cfg(any(not(feature = "gpu"), sppark_cuda_stub))]
+pub fn sparse_quotient_bw6_gpu_available() -> bool {
     false
 }
 
@@ -1073,5 +1516,274 @@ pub fn compute_sparse_quotient_coeffs_mnt4_298_gpu(
     _max_col_b: u32,
     _max_diag_per_pair: u32,
 ) -> Result<Vec<SparseQuotientPairOutput>, SparseQuotientGpuError> {
+    Err(SparseQuotientGpuError::KernelUnavailable)
+}
+
+/// Compute sparse quotient coefficients on GPU for MNT6-298
+///
+/// This function computes the coefficient accumulation phase of sparse quotient
+/// computation for a batch of (i,j) pairs. The coefficients are used to build
+/// MSM tasks for computing H_{ij} bases.
+///
+/// # Arguments
+/// * `col_a` - Sparse matrix A in CSR format (column i has entries col_a.values[col_a.col_ptr[i]..col_a.col_ptr[i+1]])
+/// * `col_b` - Sparse matrix B in CSR format
+/// * `domain_elements` - ω^k for k = 0..domain_size-1 (as u32[10] arrays)
+/// * `inv_domain_elements` - ω^{-k} for k = 0..domain_size-1
+/// * `inv_n_one_minus_omega` - precomputed inv(n * (1 - ω^d)) for d = 0..domain_size-1
+/// * `domain_size` - size of evaluation domain
+/// * `pairs` - batch of (i, j) pairs to process
+/// * `max_col_a` - maximum entries per column in A (for output sizing)
+/// * `max_col_b` - maximum entries per column in B (for output sizing)
+/// * `max_diag_per_pair` - maximum diagonal terms per pair (typically min(max_col_a, max_col_b))
+///
+/// # Returns
+/// Vector of SparseQuotientPairOutput, one per input pair
+#[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
+pub fn compute_sparse_quotient_coeffs_mnt6_298_gpu(
+    col_a: &SparseMatrixCsr,
+    col_b: &SparseMatrixCsr,
+    domain_elements: &[[u32; 10]],
+    inv_domain_elements: &[[u32; 10]],
+    inv_n_one_minus_omega: &[[u32; 10]],
+    domain_size: u32,
+    pairs: &[(u32, u32)],
+    max_col_a: u32,
+    max_col_b: u32,
+    max_diag_per_pair: u32,
+) -> Result<Vec<SparseQuotientPairOutput>, SparseQuotientGpuError> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_pairs = pairs.len() as u32;
+
+    // Split pairs into separate arrays
+    let pairs_i: Vec<u32> = pairs.iter().map(|(i, _)| *i).collect();
+    let pairs_j: Vec<u32> = pairs.iter().map(|(_, j)| *j).collect();
+
+    // Allocate output buffers
+    let mut out_acc_u = vec![[0u32; 10]; (num_pairs as usize) * (max_col_a as usize)];
+    let mut out_acc_v = vec![[0u32; 10]; (num_pairs as usize) * (max_col_b as usize)];
+    let mut out_diag_k = vec![0u32; (num_pairs as usize) * (max_diag_per_pair as usize)];
+    let mut out_diag_val = vec![[0u32; 10]; (num_pairs as usize) * (max_diag_per_pair as usize)];
+    let mut out_num_diag = vec![0u32; num_pairs as usize];
+
+    let status = unsafe {
+        sparse_quotient_coeffs_mnt6_298_gpu(
+            col_a.col_ptr.as_ptr(),
+            col_a.row_idx.as_ptr(),
+            col_a.values.as_ptr(),
+            (col_a.col_ptr.len() - 1) as u32,
+            col_a.values.len() as u32,
+            col_b.col_ptr.as_ptr(),
+            col_b.row_idx.as_ptr(),
+            col_b.values.as_ptr(),
+            (col_b.col_ptr.len() - 1) as u32,
+            col_b.values.len() as u32,
+            domain_elements.as_ptr(),
+            inv_domain_elements.as_ptr(),
+            inv_n_one_minus_omega.as_ptr(),
+            domain_size,
+            pairs_i.as_ptr(),
+            pairs_j.as_ptr(),
+            num_pairs,
+            max_col_a,
+            max_col_b,
+            max_diag_per_pair,
+            out_acc_u.as_mut_ptr(),
+            out_acc_v.as_mut_ptr(),
+            out_diag_k.as_mut_ptr(),
+            out_diag_val.as_mut_ptr(),
+            out_num_diag.as_mut_ptr(),
+        )
+    };
+
+    if status != 0 {
+        return Err(SparseQuotientGpuError::from_status(status));
+    }
+
+    // Convert output buffers to per-pair results
+    let mut results = Vec::with_capacity(pairs.len());
+
+    for pair_idx in 0..pairs.len() {
+        let (i, j) = pairs[pair_idx];
+
+        // Get column sizes from CSR structure
+        let n_u = (col_a.col_ptr[i as usize + 1] - col_a.col_ptr[i as usize]) as usize;
+        let n_v = (col_b.col_ptr[j as usize + 1] - col_b.col_ptr[j as usize]) as usize;
+
+        // Extract acc_u for this pair
+        let acc_u_start = pair_idx * (max_col_a as usize);
+        let acc_u: Vec<[u32; 10]> = out_acc_u[acc_u_start..acc_u_start + n_u].to_vec();
+
+        // Extract acc_v for this pair
+        let acc_v_start = pair_idx * (max_col_b as usize);
+        let acc_v: Vec<[u32; 10]> = out_acc_v[acc_v_start..acc_v_start + n_v].to_vec();
+
+        // Extract diagonal terms for this pair
+        let num_diag = out_num_diag[pair_idx] as usize;
+        let diag_start = pair_idx * (max_diag_per_pair as usize);
+        let diag_terms: Vec<(u32, [u32; 10])> = (0..num_diag)
+            .map(|d| (out_diag_k[diag_start + d], out_diag_val[diag_start + d]))
+            .collect();
+
+        results.push(SparseQuotientPairOutput {
+            acc_u,
+            acc_v,
+            diag_terms,
+        });
+    }
+
+    Ok(results)
+}
+
+#[cfg(all(feature = "gpu", sppark_cuda_stub))]
+pub fn compute_sparse_quotient_coeffs_mnt6_298_gpu(
+    _col_a: &SparseMatrixCsr,
+    _col_b: &SparseMatrixCsr,
+    _domain_elements: &[[u32; 10]],
+    _inv_domain_elements: &[[u32; 10]],
+    _inv_n_one_minus_omega: &[[u32; 10]],
+    _domain_size: u32,
+    _pairs: &[(u32, u32)],
+    _max_col_a: u32,
+    _max_col_b: u32,
+    _max_diag_per_pair: u32,
+) -> Result<Vec<SparseQuotientPairOutput>, SparseQuotientGpuError> {
+    Err(SparseQuotientGpuError::KernelUnavailable)
+}
+
+/// Compute sparse quotient coefficients on GPU for BW6-761
+///
+/// This function computes the coefficient accumulation phase of sparse quotient
+/// computation for a batch of (i,j) pairs using the BW6-761 scalar field (377-bit).
+///
+/// # Arguments
+/// * `col_a` - Sparse matrix A in CSR format (column i has entries col_a.values[col_a.col_ptr[i]..col_a.col_ptr[i+1]])
+/// * `col_b` - Sparse matrix B in CSR format
+/// * `domain_elements` - ω^k for k = 0..domain_size-1 (as u32[12] arrays)
+/// * `inv_domain_elements` - ω^{-k} for k = 0..domain_size-1
+/// * `inv_n_one_minus_omega` - precomputed inv(n * (1 - ω^d)) for d = 0..domain_size-1
+/// * `domain_size` - size of evaluation domain
+/// * `pairs` - batch of (i, j) pairs to process
+/// * `max_col_a` - maximum entries per column in A (for output sizing)
+/// * `max_col_b` - maximum entries per column in B (for output sizing)
+/// * `max_diag_per_pair` - maximum diagonal terms per pair (typically min(max_col_a, max_col_b))
+///
+/// # Returns
+/// Vector of SparseQuotientPairOutputBw6, one per input pair
+#[cfg(all(feature = "gpu", not(sppark_cuda_stub)))]
+pub fn compute_sparse_quotient_coeffs_bw6_761_gpu(
+    col_a: &SparseMatrixCsrBw6,
+    col_b: &SparseMatrixCsrBw6,
+    domain_elements: &[[u32; 12]],
+    inv_domain_elements: &[[u32; 12]],
+    inv_n_one_minus_omega: &[[u32; 12]],
+    domain_size: u32,
+    pairs: &[(u32, u32)],
+    max_col_a: u32,
+    max_col_b: u32,
+    max_diag_per_pair: u32,
+) -> Result<Vec<SparseQuotientPairOutputBw6>, SparseQuotientGpuError> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_pairs = pairs.len() as u32;
+
+    // Split pairs into separate arrays
+    let pairs_i: Vec<u32> = pairs.iter().map(|(i, _)| *i).collect();
+    let pairs_j: Vec<u32> = pairs.iter().map(|(_, j)| *j).collect();
+
+    // Allocate output buffers
+    let mut out_acc_u = vec![[0u32; 12]; (num_pairs as usize) * (max_col_a as usize)];
+    let mut out_acc_v = vec![[0u32; 12]; (num_pairs as usize) * (max_col_b as usize)];
+    let mut out_diag_k = vec![0u32; (num_pairs as usize) * (max_diag_per_pair as usize)];
+    let mut out_diag_val = vec![[0u32; 12]; (num_pairs as usize) * (max_diag_per_pair as usize)];
+    let mut out_num_diag = vec![0u32; num_pairs as usize];
+
+    let status = unsafe {
+        sparse_quotient_coeffs_bw6_761_gpu(
+            col_a.col_ptr.as_ptr(),
+            col_a.row_idx.as_ptr(),
+            col_a.values.as_ptr(),
+            (col_a.col_ptr.len() - 1) as u32,
+            col_a.values.len() as u32,
+            col_b.col_ptr.as_ptr(),
+            col_b.row_idx.as_ptr(),
+            col_b.values.as_ptr(),
+            (col_b.col_ptr.len() - 1) as u32,
+            col_b.values.len() as u32,
+            domain_elements.as_ptr(),
+            inv_domain_elements.as_ptr(),
+            inv_n_one_minus_omega.as_ptr(),
+            domain_size,
+            pairs_i.as_ptr(),
+            pairs_j.as_ptr(),
+            num_pairs,
+            max_col_a,
+            max_col_b,
+            max_diag_per_pair,
+            out_acc_u.as_mut_ptr(),
+            out_acc_v.as_mut_ptr(),
+            out_diag_k.as_mut_ptr(),
+            out_diag_val.as_mut_ptr(),
+            out_num_diag.as_mut_ptr(),
+        )
+    };
+
+    if status != 0 {
+        return Err(SparseQuotientGpuError::from_status(status));
+    }
+
+    // Convert output buffers to per-pair results
+    let mut results = Vec::with_capacity(pairs.len());
+
+    for pair_idx in 0..pairs.len() {
+        let (i, j) = pairs[pair_idx];
+
+        // Get column sizes from CSR structure
+        let n_u = (col_a.col_ptr[i as usize + 1] - col_a.col_ptr[i as usize]) as usize;
+        let n_v = (col_b.col_ptr[j as usize + 1] - col_b.col_ptr[j as usize]) as usize;
+
+        // Extract acc_u for this pair
+        let acc_u_start = pair_idx * (max_col_a as usize);
+        let acc_u: Vec<[u32; 12]> = out_acc_u[acc_u_start..acc_u_start + n_u].to_vec();
+
+        // Extract acc_v for this pair
+        let acc_v_start = pair_idx * (max_col_b as usize);
+        let acc_v: Vec<[u32; 12]> = out_acc_v[acc_v_start..acc_v_start + n_v].to_vec();
+
+        // Extract diagonal terms for this pair
+        let num_diag = out_num_diag[pair_idx] as usize;
+        let diag_start = pair_idx * (max_diag_per_pair as usize);
+        let diag_terms: Vec<(u32, [u32; 12])> = (0..num_diag)
+            .map(|d| (out_diag_k[diag_start + d], out_diag_val[diag_start + d]))
+            .collect();
+
+        results.push(SparseQuotientPairOutputBw6 {
+            acc_u,
+            acc_v,
+            diag_terms,
+        });
+    }
+
+    Ok(results)
+}
+
+#[cfg(all(feature = "gpu", sppark_cuda_stub))]
+pub fn compute_sparse_quotient_coeffs_bw6_761_gpu(
+    _col_a: &SparseMatrixCsrBw6,
+    _col_b: &SparseMatrixCsrBw6,
+    _domain_elements: &[[u32; 12]],
+    _inv_domain_elements: &[[u32; 12]],
+    _inv_n_one_minus_omega: &[[u32; 12]],
+    _domain_size: u32,
+    _pairs: &[(u32, u32)],
+    _max_col_a: u32,
+    _max_col_b: u32,
+    _max_diag_per_pair: u32,
+) -> Result<Vec<SparseQuotientPairOutputBw6>, SparseQuotientGpuError> {
     Err(SparseQuotientGpuError::KernelUnavailable)
 }
