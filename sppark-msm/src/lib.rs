@@ -1417,9 +1417,50 @@ pub fn compute_sparse_quotient_coeffs_mnt4_298_gpu(
     max_col_b: u32,
     max_diag_per_pair: u32,
 ) -> Result<Vec<SparseQuotientPairOutput>, SparseQuotientGpuError> {
+    use ark_ff::PrimeField;
+    use ark_mnt4_298::Fr as MNT4Fr;
+
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
+
+    let domain_len = domain_elements.len();
+    let inv_n_len = inv_n_one_minus_omega.len();
+    let domain_size_usize = domain_size as usize;
+    if domain_len < domain_size_usize || inv_n_len < domain_size_usize {
+        return Err(SparseQuotientGpuError::InvalidInput);
+    }
+
+    fn u32_array_to_fr(arr: &[u32; 10]) -> MNT4Fr {
+        let mut limbs = [0u64; 5];
+        for i in 0..5 {
+            limbs[i] = (arr[2 * i] as u64) | ((arr[2 * i + 1] as u64) << 32);
+        }
+        MNT4Fr::from_bigint(ark_ff::BigInt(limbs)).expect("valid MNT4 field element")
+    }
+
+    fn fr_to_u32_array(fr: &MNT4Fr) -> [u32; 10] {
+        let bigint = fr.into_bigint();
+        let mut limbs = [0u32; 10];
+        for (i, &limb64) in bigint.0.iter().enumerate() {
+            limbs[2 * i] = limb64 as u32;
+            limbs[2 * i + 1] = (limb64 >> 32) as u32;
+        }
+        limbs
+    }
+
+    // Precompute omega^d * inv(n * (1 - omega^d)) to save a multiply per term on GPU.
+    let omega_d_inv_n: Vec<[u32; 10]> = domain_elements
+        .iter()
+        .zip(inv_n_one_minus_omega.iter())
+        .take(domain_size_usize)
+        .map(|(omega_d, inv_n_term)| {
+            let omega = u32_array_to_fr(omega_d);
+            let inv_n = u32_array_to_fr(inv_n_term);
+            let coeff = omega * inv_n;
+            fr_to_u32_array(&coeff)
+        })
+        .collect();
 
     let num_pairs = pairs.len() as u32;
 
@@ -1446,7 +1487,7 @@ pub fn compute_sparse_quotient_coeffs_mnt4_298_gpu(
             col_b.values.as_ptr(),
             (col_b.col_ptr.len() - 1) as u32,
             col_b.values.len() as u32,
-            domain_elements.as_ptr(),
+            omega_d_inv_n.as_ptr(),
             inv_domain_elements.as_ptr(),
             inv_n_one_minus_omega.as_ptr(),
             domain_size,
@@ -1552,9 +1593,50 @@ pub fn compute_sparse_quotient_coeffs_mnt6_298_gpu(
     max_col_b: u32,
     max_diag_per_pair: u32,
 ) -> Result<Vec<SparseQuotientPairOutput>, SparseQuotientGpuError> {
+    use ark_ff::PrimeField;
+    use ark_mnt6_298::Fr as MNT6Fr;
+
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
+
+    let domain_len = domain_elements.len();
+    let inv_n_len = inv_n_one_minus_omega.len();
+    let domain_size_usize = domain_size as usize;
+    if domain_len < domain_size_usize || inv_n_len < domain_size_usize {
+        return Err(SparseQuotientGpuError::InvalidInput);
+    }
+
+    fn u32_array_to_fr(arr: &[u32; 10]) -> MNT6Fr {
+        let mut limbs = [0u64; 5];
+        for i in 0..5 {
+            limbs[i] = (arr[2 * i] as u64) | ((arr[2 * i + 1] as u64) << 32);
+        }
+        MNT6Fr::from_bigint(ark_ff::BigInt(limbs)).expect("valid MNT6 field element")
+    }
+
+    fn fr_to_u32_array(fr: &MNT6Fr) -> [u32; 10] {
+        let bigint = fr.into_bigint();
+        let mut limbs = [0u32; 10];
+        for (i, &limb64) in bigint.0.iter().enumerate() {
+            limbs[2 * i] = limb64 as u32;
+            limbs[2 * i + 1] = (limb64 >> 32) as u32;
+        }
+        limbs
+    }
+
+    // Precompute omega^d * inv(n * (1 - omega^d)) to save a multiply per term on GPU.
+    let omega_d_inv_n: Vec<[u32; 10]> = domain_elements
+        .iter()
+        .zip(inv_n_one_minus_omega.iter())
+        .take(domain_size_usize)
+        .map(|(omega_d, inv_n_term)| {
+            let omega = u32_array_to_fr(omega_d);
+            let inv_n = u32_array_to_fr(inv_n_term);
+            let coeff = omega * inv_n;
+            fr_to_u32_array(&coeff)
+        })
+        .collect();
 
     let num_pairs = pairs.len() as u32;
 
@@ -1581,7 +1663,7 @@ pub fn compute_sparse_quotient_coeffs_mnt6_298_gpu(
             col_b.values.as_ptr(),
             (col_b.col_ptr.len() - 1) as u32,
             col_b.values.len() as u32,
-            domain_elements.as_ptr(),
+            omega_d_inv_n.as_ptr(),
             inv_domain_elements.as_ptr(),
             inv_n_one_minus_omega.as_ptr(),
             domain_size,
@@ -1686,9 +1768,50 @@ pub fn compute_sparse_quotient_coeffs_bw6_761_gpu(
     max_col_b: u32,
     max_diag_per_pair: u32,
 ) -> Result<Vec<SparseQuotientPairOutputBw6>, SparseQuotientGpuError> {
+    use ark_bw6_761::Fr as BW6Fr;
+    use ark_ff::PrimeField;
+
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
+
+    let domain_len = domain_elements.len();
+    let inv_n_len = inv_n_one_minus_omega.len();
+    let domain_size_usize = domain_size as usize;
+    if domain_len < domain_size_usize || inv_n_len < domain_size_usize {
+        return Err(SparseQuotientGpuError::InvalidInput);
+    }
+
+    fn u32_array_to_fr(arr: &[u32; 12]) -> BW6Fr {
+        let mut limbs = [0u64; 6];
+        for i in 0..6 {
+            limbs[i] = (arr[2 * i] as u64) | ((arr[2 * i + 1] as u64) << 32);
+        }
+        BW6Fr::from_bigint(ark_ff::BigInt(limbs)).expect("valid BW6 field element")
+    }
+
+    fn fr_to_u32_array(fr: &BW6Fr) -> [u32; 12] {
+        let bigint = fr.into_bigint();
+        let mut limbs = [0u32; 12];
+        for (i, &limb64) in bigint.0.iter().enumerate() {
+            limbs[2 * i] = limb64 as u32;
+            limbs[2 * i + 1] = (limb64 >> 32) as u32;
+        }
+        limbs
+    }
+
+    // Precompute omega^d * inv(n * (1 - omega^d)) to save a multiply per term on GPU.
+    let omega_d_inv_n: Vec<[u32; 12]> = domain_elements
+        .iter()
+        .zip(inv_n_one_minus_omega.iter())
+        .take(domain_size_usize)
+        .map(|(omega_d, inv_n_term)| {
+            let omega = u32_array_to_fr(omega_d);
+            let inv_n = u32_array_to_fr(inv_n_term);
+            let coeff = omega * inv_n;
+            fr_to_u32_array(&coeff)
+        })
+        .collect();
 
     let num_pairs = pairs.len() as u32;
 
@@ -1715,7 +1838,7 @@ pub fn compute_sparse_quotient_coeffs_bw6_761_gpu(
             col_b.values.as_ptr(),
             (col_b.col_ptr.len() - 1) as u32,
             col_b.values.len() as u32,
-            domain_elements.as_ptr(),
+            omega_d_inv_n.as_ptr(),
             inv_domain_elements.as_ptr(),
             inv_n_one_minus_omega.as_ptr(),
             domain_size,

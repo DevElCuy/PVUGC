@@ -4,15 +4,15 @@ This document analyzes whether enterprise GPUs (H100, A100) can practically hand
 
 ## Executive Summary
 
-**Full circuit CRS generation is computationally infeasible with current throughput.** Benchmarks show ~20-24 pairs/sec for MNT4/MNT6 and ~17-21 pairs/sec for BW6-761 on GTX 1660 (6GB). The bottleneck is computational complexity, not GPU memory.
+**Full circuit CRS generation is computationally infeasible with current throughput.** Benchmarks show ~65-95 pairs/sec for MNT4-298 on GTX 1660 (6GB). The bottleneck is computational complexity, not GPU memory.
 
 | Curve | GTX 1660 (measured) | H100 (projected) | Status |
 |-------|---------------------|------------------|--------|
-| MNT4-298 | ~20-24 pairs/sec → **~1 year** | ~160-240/sec → **~1-2 months** | Implemented |
+| MNT4-298 | ~65-95 pairs/sec → **~83 days** | ~520-950/sec → **~8-15 days** | Implemented |
 | MNT6-298 | ~20-24 pairs/sec → **~1 year** | ~160-240/sec → **~1-2 months** | Implemented |
 | BW6-761 | ~17-21 pairs/sec → **~1.2 years** | ~140-200/sec → **~1.5-2 months** | Implemented |
 
-**Critical observation:** Measured throughput is ~1000× lower than initial estimates due to kernel bottlenecks (see [Identified Bottlenecks](#identified-bottlenecks-january-2026)). Fixing these could restore expected performance.
+**Critical observation:** Recent algorithmic optimizations (precomputing `omega^d * inv_n_one_minus_omega[d]`) improved MNT4-298 throughput by ~3-4×. MNT6/BW6 numbers are from prior measurements and may improve with the same optimizations.
 
 ---
 
@@ -116,46 +116,43 @@ The ~1000× gap between estimated and measured throughput suggests the bottlenec
 Benchmark run on GTX 1660 (6GB) with `benchmark_gpu_scalability` test:
 
 ```
-GPU Memory: Total 5926MB, Available 5424MB, Target 4339MB (80%)
+GPU Memory: Total 5926MB, Available 5443MB, Target 4354MB (80%)
 Domain size: 1024, NNZ per column: 100
 ```
 
-#### Measured Results at 100 Pairs
+#### MNT4-298 Measured Results (with precomputation optimization)
 
-| Curve | Time (ms) | Throughput (pairs/sec) | bytes_per_pair |
+| Pairs | Time (ms) | Throughput (pairs/sec) | bytes_per_pair |
 |-------|-----------|------------------------|----------------|
-| MNT4-298 | 4,230 | **23.64** | 12,400 |
-| MNT6-298 | 4,086 | **24.47** | 12,400 |
-| BW6-761 | 4,686 | **21.34** | 14,800 |
+| 100 | 1,054 | **94.88** | 12,400 |
+| 1,000 | 14,424 | **69.33** | 12,400 |
+| 10,000 | 154,206 | **64.85** | 12,400 |
 
-#### Measured Results at 1000 Pairs
+#### MNT6-298 / BW6-761 (prior measurements, before optimization)
 
-| Curve | Time (ms) | Throughput (pairs/sec) | bytes_per_pair |
-|-------|-----------|------------------------|----------------|
-| MNT4-298 | 48,625 | **20.57** | 12,400 |
-| MNT6-298 | 48,709 | **20.53** | 12,400 |
-| BW6-761 | 56,264 | **17.77** | 14,800 |
+| Curve | Pairs | Time (ms) | Throughput (pairs/sec) | bytes_per_pair |
+|-------|-------|-----------|------------------------|----------------|
+| MNT6-298 | 100 | 4,086 | **24.47** | 12,400 |
+| MNT6-298 | 1,000 | 48,709 | **20.53** | 12,400 |
+| BW6-761 | 100 | 4,686 | **21.34** | 14,800 |
+| BW6-761 | 1,000 | 56,264 | **17.77** | 14,800 |
 
-**Critical finding:** Measured throughput is ~20-24 pairs/sec, approximately **1000× slower** than initial estimates of 10,000-20,000 pairs/sec. This suggests either:
-1. The workload per pair is much larger than estimated (100 NNZ per column × domain size 1024 = significant work)
-2. Kernel launch overhead dominates at small batch sizes
-3. Memory bandwidth limitations in CGBN operations
-4. Suboptimal kernel implementation requiring optimization
+**Key finding:** The precomputation optimization (computing `omega^d * inv_n_one_minus_omega[d]` on CPU) improved MNT4-298 throughput by ~3-4× compared to prior measurements. MNT6/BW6 have the same optimization applied but need re-benchmarking to confirm similar gains.
 
 ### Time Projections Based on Measured Throughput
 
-Using conservative 20 pairs/sec (MNT4/MNT6) and 18 pairs/sec (BW6-761):
+Using measured MNT4-298 (~65 pairs/sec) and prior MNT6/BW6 (~20/18 pairs/sec):
 
-| Circuit | Pairs | MNT4/MNT6 (20/s) | BW6-761 (18/s) |
-|---------|-------|------------------|----------------|
-| **Full (680M)** | 680,000,000 | **~1.08 years** | **~1.20 years** |
-| Skip Verifier (160M) | 160,000,000 | ~93 days | ~103 days |
-| 1M pairs | 1,000,000 | ~14 hours | ~15.4 hours |
-| 10K pairs | 10,000 | ~8.3 min | ~9.3 min |
-| 1K pairs | 1,000 | ~50 sec | ~56 sec |
-| 100 pairs | 100 | ~4-5 sec | ~4-5 sec |
+| Circuit | Pairs | MNT4-298 (65/s) | MNT6-298 (20/s) | BW6-761 (18/s) |
+|---------|-------|-----------------|-----------------|----------------|
+| **Full (680M)** | 680,000,000 | **~121 days** | **~1.08 years** | **~1.20 years** |
+| Skip Verifier (160M) | 160,000,000 | ~28 days | ~93 days | ~103 days |
+| 1M pairs | 1,000,000 | ~4.3 hours | ~14 hours | ~15.4 hours |
+| 10K pairs | 10,000 | ~2.6 min | ~8.3 min | ~9.3 min |
+| 1K pairs | 1,000 | ~15 sec | ~50 sec | ~56 sec |
+| 100 pairs | 100 | ~1 sec | ~4-5 sec | ~4-5 sec |
 
-**Note:** These are based on actual benchmark measurements, not theoretical estimates.
+**Note:** MNT4-298 numbers reflect the precomputation optimization. MNT6/BW6 should see similar ~3-4× improvement once re-benchmarked.
 
 ---
 

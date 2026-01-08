@@ -183,8 +183,8 @@ __global__ void compute_quotient_coeffs_kernel(
     const uint32_t* col_b_idx,
     const scalar_t* col_b_val,
     // Precomputed domain element tables
-    const scalar_t* domain_elements,      // ω^k for k = 0..n-1
-    const scalar_t* inv_domain_elements,  // ω^{-k} for k = 0..n-1
+    const scalar_t* domain_elements,      // ω^d * inv(n * (1 - ω^d)) for d = 0..n-1 (precomputed)
+    const scalar_t* inv_domain_elements,  // unused (kept for ABI)
     const scalar_t* inv_n_one_minus_omega, // inv(n * (1 - ω^d)) for d = 0..n-1
     uint32_t domain_size,
     // Pair assignments for this batch
@@ -211,6 +211,7 @@ __global__ void compute_quotient_coeffs_kernel(
     if (pair_idx >= num_pairs) return;
 
     constexpr uint32_t TPI = sparse_quotient_cgbn_params_t::TPI;
+    (void)inv_domain_elements;
 
     // Instance ID within block (for CGBN cooperative groups)
     int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / TPI;
@@ -317,25 +318,16 @@ __global__ void compute_quotient_coeffs_kernel(
                     kernel.store_scalar(&out_diag_val[pair_idx * max_diag_per_pair + diag_slot], prod);
                 }
             } else {
-                // Off-diagonal term: accumulate contribution to acc_u
+                // Off-diagonal term: accumulate contribution to acc_u.
+                // Simplified: inv_wm * wm cancels, so acc_u -= prod * inv_n_one_minus_omega[d].
                 uint32_t d = (k >= m) ? (k - m) : (k + domain_size - m);
 
-                bn_t wm, inv_wm, inv_n_term, inv_denom, common, tmp;
+                bn_t inv_n_term, tmp;
 
-                kernel.load_scalar(wm, &domain_elements[m]);
-                kernel.load_scalar(inv_wm, &inv_domain_elements[m]);
                 kernel.load_scalar(inv_n_term, &inv_n_one_minus_omega[d]);
 
-                // inv_denom = -inv_wm * inv_n_term
-                kernel.field_mul(inv_denom, inv_wm, inv_n_term, Fr);
-                kernel.field_neg(inv_denom, inv_denom, Fr);
-
-                // common = prod * inv_denom
-                kernel.field_mul(common, prod, inv_denom, Fr);
-
-                // acc_u[idx_u] += common * wm
-                kernel.field_mul(tmp, common, wm, Fr);
-                kernel.field_add(acc_u_local, acc_u_local, tmp, Fr);
+                kernel.field_mul(tmp, prod, inv_n_term, Fr);
+                kernel.field_sub(acc_u_local, acc_u_local, tmp, Fr);
             }
         }
 
@@ -376,22 +368,12 @@ __global__ void compute_quotient_coeffs_kernel(
             // Off-diagonal term: accumulate contribution to acc_v
             uint32_t d = (k >= m) ? (k - m) : (k + domain_size - m);
 
-            bn_t wk, inv_wm, inv_n_term, inv_denom, common, tmp;
+            bn_t coeff, contrib;
 
-            kernel.load_scalar(wk, &domain_elements[k]);
-            kernel.load_scalar(inv_wm, &inv_domain_elements[m]);
-            kernel.load_scalar(inv_n_term, &inv_n_one_minus_omega[d]);
-
-            // inv_denom = -inv_wm * inv_n_term
-            kernel.field_mul(inv_denom, inv_wm, inv_n_term, Fr);
-            kernel.field_neg(inv_denom, inv_denom, Fr);
-
-            // common = prod * inv_denom
-            kernel.field_mul(common, prod, inv_denom, Fr);
-
-            // acc_v[idx_v] -= common * wk
-            kernel.field_mul(tmp, common, wk, Fr);
-            kernel.field_sub(acc_v_local, acc_v_local, tmp, Fr);
+            // domain_elements[d] already contains omega^d * inv_n_one_minus_omega[d]
+            kernel.load_scalar(coeff, &domain_elements[d]);
+            kernel.field_mul(contrib, prod, coeff, Fr);
+            kernel.field_add(acc_v_local, acc_v_local, contrib, Fr);
         }
 
         // Store accumulated result for this idx_v
@@ -418,8 +400,8 @@ extern "C" {
  * Parameters:
  *   col_a_ptr, col_a_idx, col_a_val: Sparse matrix A in CSR format
  *   col_b_ptr, col_b_idx, col_b_val: Sparse matrix B in CSR format
- *   domain_elements: ω^k for k = 0..domain_size-1 (40 bytes each)
- *   inv_domain_elements: ω^{-k} (40 bytes each)
+ *   domain_elements: ω^d * inv(n * (1 - ω^d)) for d = 0..domain_size-1 (40 bytes each)
+ *   inv_domain_elements: unused (kept for ABI)
  *   inv_n_one_minus_omega: precomputed inverses (40 bytes each)
  *   domain_size: size of evaluation domain (n)
  *   num_cols_a, num_cols_b: number of columns in each matrix

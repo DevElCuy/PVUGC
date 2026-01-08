@@ -147,9 +147,9 @@ __global__ void compute_quotient_coeffs_bw6_kernel(
     const uint32_t* col_b_idx,
     const scalar_t* col_b_val,
     // Precomputed domain element tables
-    const scalar_t* domain_elements,
-    const scalar_t* inv_domain_elements,
-    const scalar_t* inv_n_one_minus_omega,
+    const scalar_t* domain_elements,      // omega^d * inv(n * (1 - omega^d)) for d = 0..n-1 (precomputed)
+    const scalar_t* inv_domain_elements,  // unused (kept for ABI)
+    const scalar_t* inv_n_one_minus_omega, // inv(n * (1 - omega^d)) for d = 0..n-1
     uint32_t domain_size,
     // Pair assignments
     const uint32_t* pairs_i,
@@ -172,6 +172,7 @@ __global__ void compute_quotient_coeffs_bw6_kernel(
     if (pair_idx >= num_pairs) return;
 
     constexpr uint32_t TPI = sparse_quotient_bw6_cgbn_params_t::TPI;
+    (void)inv_domain_elements;
 
     int32_t instance = (blockIdx.x * blockDim.x + threadIdx.x) / TPI;
 
@@ -262,21 +263,15 @@ __global__ void compute_quotient_coeffs_bw6_kernel(
                     kernel.store_scalar(&out_diag_val[pair_idx * max_diag_per_pair + diag_slot], prod);
                 }
             } else {
+                // Simplified: inv_wm * wm cancels, so acc_u -= prod * inv_n_one_minus_omega[d].
                 uint32_t d = (k >= m) ? (k - m) : (k + domain_size - m);
 
-                bn_t wm, inv_wm, inv_n_term, inv_denom, common, tmp;
+                bn_t inv_n_term, tmp;
 
-                kernel.load_scalar(wm, &domain_elements[m]);
-                kernel.load_scalar(inv_wm, &inv_domain_elements[m]);
                 kernel.load_scalar(inv_n_term, &inv_n_one_minus_omega[d]);
 
-                kernel.field_mul(inv_denom, inv_wm, inv_n_term, Fr);
-                kernel.field_neg(inv_denom, inv_denom, Fr);
-
-                kernel.field_mul(common, prod, inv_denom, Fr);
-
-                kernel.field_mul(tmp, common, wm, Fr);
-                kernel.field_add(acc_u_local, acc_u_local, tmp, Fr);
+                kernel.field_mul(tmp, prod, inv_n_term, Fr);
+                kernel.field_sub(acc_u_local, acc_u_local, tmp, Fr);
             }
         }
 
@@ -309,19 +304,12 @@ __global__ void compute_quotient_coeffs_bw6_kernel(
 
             uint32_t d = (k >= m) ? (k - m) : (k + domain_size - m);
 
-            bn_t wk, inv_wm, inv_n_term, inv_denom, common, tmp;
+            bn_t coeff, contrib;
 
-            kernel.load_scalar(wk, &domain_elements[k]);
-            kernel.load_scalar(inv_wm, &inv_domain_elements[m]);
-            kernel.load_scalar(inv_n_term, &inv_n_one_minus_omega[d]);
-
-            kernel.field_mul(inv_denom, inv_wm, inv_n_term, Fr);
-            kernel.field_neg(inv_denom, inv_denom, Fr);
-
-            kernel.field_mul(common, prod, inv_denom, Fr);
-
-            kernel.field_mul(tmp, common, wk, Fr);
-            kernel.field_sub(acc_v_local, acc_v_local, tmp, Fr);
+            // domain_elements[d] contains precomputed omega^d * inv_n_one_minus_omega[d]
+            kernel.load_scalar(coeff, &domain_elements[d]);
+            kernel.field_mul(contrib, prod, coeff, Fr);
+            kernel.field_add(acc_v_local, acc_v_local, contrib, Fr);
         }
 
         kernel.store_scalar(&out_acc_v[pair_idx * max_col_b + idx_v], acc_v_local);

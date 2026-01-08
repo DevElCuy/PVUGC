@@ -123,6 +123,7 @@ GPU path is used when:
 - `SparseMatrixCsr` and `SparseQuotientPairOutput` live in `sppark-msm/src/lib.rs` and define CSR inputs and per-pair outputs.
 - GPU entrypoint: `compute_sparse_quotient_coeffs_mnt4_298_gpu(...)`.
 - CUDA kernels exist for both MNT4 and MNT6; the Rust wrapper uses the MNT4 variant because MNT4 Fr == MNT6 Fq in the cycle.
+- **Note:** CPU precompute expects `domain_elements` and `inv_n_one_minus_omega` limbs to be in canonical (reduced) field form. This is the default for arkworks-generated tables; custom limb sources should ensure reduced, non-Montgomery representation.
 
 ```rust
 pub struct SparseMatrixCsr {
@@ -312,11 +313,11 @@ cargo test --release --features gpu sparse_quotient_integration_tests
 
 ### Run MNT4 Tests
 ```bash
-# Basic kernel launch tests
-cargo test --release --features gpu --test test_gpu_cgbn_mnt4
-
-# Full consistency tests
+# CPU vs GPU consistency (run first)
 cargo test --release --features gpu --test test_mnt4_cpu_gpu_consistency
+
+# MNT4 kernel launch (run after consistency)
+cargo test --release --features gpu --test test_gpu_cgbn_mnt4
 ```
 
 ### Run MNT6 Tests
